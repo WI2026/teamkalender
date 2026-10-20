@@ -23,8 +23,8 @@
   --cat-buero: #8e8e93;
   --cat-abwesend: #34c759;
   --shadow: 0 1px 1px rgba(0,0,0,.04), 0 18px 40px -12px rgba(30,40,80,.28);
-  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
-  --font-data: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  --font-data: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --radius: 12px;
 }
@@ -59,11 +59,14 @@ html, body { height: 100%; }
 body {
   background: var(--bg); color: var(--fg);
   font-family: var(--font-ui); font-size: 14px; line-height: 1.45;
-  padding-inline: 16px; padding-block: 16px 24px;
+  padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right));
+  padding-block: 16px max(24px, env(safe-area-inset-bottom));
   -webkit-font-smoothing: antialiased;
 }
 ::selection { background: var(--accent-soft); color: var(--fg); }
 button, input, select, textarea { font: inherit; color: inherit; }
+/* iOS vergrößert die Seite bei Eingabefeldern unter 16px */
+@media (pointer: coarse) { input, select, textarea { font-size: 16px; } }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .num { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
 
@@ -354,7 +357,8 @@ select.filter { border-radius: 999px; background: var(--surface); border-color: 
 .dnum { font-size: 15px; font-weight: 500; width: 28px; height: 28px; }
 .day.today .dnum { background: var(--today); color: #fff; }
 .chip { border-radius: 7px; font-weight: 500; }
-.chip.allday { color: #fff; }
+.chip.allday { background: color-mix(in srgb, var(--c) 30%, var(--solid)); color: var(--fg); font-weight: 600;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 50%, transparent); }
 .whead .wd .d { font-size: 20px; font-weight: 600; }
 .whead .wd.today .d { color: var(--today); }
 .whead .wd.sel { box-shadow: inset 0 -2px 0 var(--fg); }

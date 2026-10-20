@@ -124,8 +124,8 @@
       for (let i = 0; i < 7; i++) {
         const d = addDays(ws, i), ds = ymd(d), evs = eventsOn(ds), hol = holidayOf(d);
         const cls = ["day", d.getMonth() !== m && "out", i >= 5 && "weekend", ds === today && "today", ds === state.selected && "sel"].filter(Boolean).join(" ");
-        const cell = el("div", { class: cls, role: "gridcell", tabindex: "0", "aria-label": `${longDate(d)}${hol ? ", " + hol : ""}, ${evs.length} Termine`,
-          onclick: () => select(ds), onkeydown: (ev) => { if (ev.key === "Enter") select(ds); } });
+        const cell = el("div", { class: cls, role: "gridcell", tabindex: "0", "data-date": ds, "aria-label": `${longDate(d)}${hol ? ", " + hol : ""}, ${evs.length} Termine`,
+          onclick: () => select(ds), onkeydown: (ev) => { if (ev.key === "Enter") { select(ds); $("board").querySelector(`[data-date="${ds}"]`)?.focus({ preventScroll: true }); } } });
         cell.addEventListener("dblclick", () => state.canWrite && openEditor(null, ds));
         const head = el("div", { class: "dhead" }, el("span", { class: "dnum" }, d.getDate()));
         if (state.canWrite) head.append(el("button", { class: "addday", type: "button", "aria-label": `Termin am ${longDate(d)} anlegen`, onclick: (ev) => { ev.stopPropagation(); openEditor(null, ds); } }, svgPlus()));
@@ -155,8 +155,12 @@
     $("periodKw").textContent = `KW ${isoWeek(ws)}`;
   }
 
+  let shownWeek = "";
   function renderWeek() {
     const ws = weekStart(); setWeekTitle(ws);
+    const old = document.querySelector("#board .wbody");
+    const keepTop = old && shownWeek === ymd(ws) ? old.scrollTop : null;
+    shownWeek = ymd(ws);
     const today = ymd(new Date());
     const wrap = el("div", { class: "week" });
     const head = el("div", { class: "whead" }, el("div"));
@@ -196,7 +200,7 @@
       body.append(col);
     }
     wrap.append(head, all, body);
-    requestAnimationFrame(() => { body.scrollTop = (7 - H_START) * hourPx; });
+    requestAnimationFrame(() => { body.scrollTop = keepTop ?? (7 - H_START) * hourPx; });
     return wrap;
   }
 
@@ -266,14 +270,19 @@
     sel.value = state.person;
   }
 
+  const phone = matchMedia("(max-width: 640px)"), calm = matchMedia("(prefers-reduced-motion: reduce)");
   function select(ds, silent) {
     state.selected = ds;
     if (!silent || state.view === "month") render(); else renderAgenda();
+    if (state.view === "month" && phone.matches) {
+      const a = $("agenda");
+      if (a.getBoundingClientRect().top > innerHeight - 120) a.scrollIntoView({ behavior: calm.matches ? "auto" : "smooth", block: "start" });
+    }
   }
 
   // ---------- Editor ----------
   const dlg = $("dlg");
-  let editingId = null;
+  let editingId = null, editingStamp = null;
   $("cats").replaceChildren(...CATS.map((c, i) => el("label", { style: `--c:${catColor(c.id)}` },
     el("input", { type: "radio", name: "cat", value: c.id, id: `cat-${c.id}`, checked: i === 0 }), c.label)));
   const syncAllDay = () => { $("timeRow").hidden = $("f-allday").checked; };
@@ -284,9 +293,9 @@
   });
 
   function openEditor(id, dateStr, start, end) {
-    editingId = id;
     const e = id ? state.events.get(id) : null;
     if (id && !e) return;
+    editingId = id; editingStamp = e ? e.updatedAt : null;
     const ro = !state.canWrite;
     $("dlgTitle").textContent = ro ? "Termin" : (e ? "Termin bearbeiten" : "Neuer Termin");
     $("f-title").value = e ? e.title : "";
@@ -306,8 +315,9 @@
     dlg.querySelectorAll("input, textarea").forEach(n => { n.disabled = ro; });
     $("stamp").textContent = e && e.updatedAt ? `Geändert ${fmtStamp(e.updatedAt)}` : "";
     syncAllDay();
+    $("f-title").autofocus = !ro && !e;
+    $("cancelBtn").autofocus = ro || !!e;
     dlg.showModal();
-    if (!ro && !e) $("f-title").focus();
   }
   const fmtStamp = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 
@@ -348,7 +358,7 @@
       createdAt: prev?.createdAt || now, createdBy: prev?.createdBy || state.myId || "", updatedAt: now };
     $("saveBtn").disabled = true;
     try {
-      if (editingId) await state.col.doc(editingId).set(body); else await state.col.add(body);
+      if (editingId) await state.col.doc(editingId).set(body, editingStamp); else await state.col.add(body);
       dlg.close();
       state.selected = date;
       const d = parse(date);
@@ -362,13 +372,16 @@
 
   function writeError(e) {
     const code = e && e.code;
-    if (code === "invalid_argument" || code === "permission_denied" || code === "unavailable") {
-      setReadOnly("Du kannst Termine ansehen, aber nicht eintragen. Bitte die Person, die den Kalender geteilt hat, dich als Mitwirkende/n freizugeben.");
-      return "Speichern nicht erlaubt: Dir fehlen Schreibrechte für diesen Kalender.";
+    if (code === "conflict") {
+      editingStamp = state.events.get(editingId)?.updatedAt || null;
+      return "Jemand hat diesen Termin gerade geändert. Abbrechen zeigt die neue Fassung, Speichern überschreibt sie mit deiner.";
     }
-    if (code === "rate_limited" || code === "resource_exhausted") return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut speichern.";
+    if (loggedOut(e)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return ""; }
+    if (code === "23514" || code === "22001") return "Ein Feld ist ungültig oder zu lang. Titel bis 120, Name bis 60, Notiz bis 1000 Zeichen.";
+    if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut speichern.";
     return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
   }
+  const loggedOut = (e) => !!e && (["42501", "PGRST301", "PGRST302", "PGRST303"].includes(e.code) || e.status === 401 || e.status === 403 || /JWT/i.test(e.message || ""));
 
   // ---------- Toast ----------
   let toastT = null;
@@ -376,12 +389,6 @@
 
   // ---------- Status ----------
   function setStatus(s, text) { $("status").dataset.state = s; $("statusText").textContent = text; }
-  function setReadOnly(msg) {
-    state.canWrite = false;
-    setStatus("readonly", "Nur Lesen");
-    $("bannerText").textContent = msg; $("banner").hidden = false;
-    render();
-  }
 
   // ---------- Navigation ----------
   function shift(n) {
@@ -415,7 +422,7 @@
 
   // ---------- Verbindung (Supabase) ----------
   const CFG = window.KALENDER_CONFIG || {};
-  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true } }) : null;
+  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } }) : null;
   const fromRow = (r) => ({ title: r.title, date: r.date, allDay: !!r.all_day, start: r.start_time || "", end: r.end_time || "",
     person: r.person || "", note: r.note || "", cat: r.cat || "buero", createdAt: r.created_at, updatedAt: r.updated_at });
   const toRow = (b) => ({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
@@ -424,14 +431,31 @@
   state.col = {
     add: async (b) => { check(await sb.from("kalender_termine").insert(toRow(b))); await loadAll(); },
     doc: (id) => ({
-      set: async (b) => { check(await sb.from("kalender_termine").update(toRow(b)).eq("id", id)); await loadAll(); },
+      // Nur speichern, wenn niemand den Termin seit dem Öffnen geändert hat.
+      set: async (b, stamp) => {
+        let q = sb.from("kalender_termine").update(toRow(b)).eq("id", id);
+        if (stamp) q = q.eq("updated_at", stamp);
+        const res = await q.select("id"); check(res);
+        if (!res.data.length) { await loadAll(); throw { code: "conflict" }; }
+        await loadAll();
+      },
       delete: async () => { check(await sb.from("kalender_termine").delete().eq("id", id)); await loadAll(); },
     }),
   };
+  // Die Datenbank liefert höchstens 1000 Zeilen pro Abfrage, daher seitenweise laden.
+  const PAGE = 1000;
+  let loadSeq = 0;
   async function loadAll() {
-    const { data, error } = await sb.from("kalender_termine").select("*").order("date").limit(5000);
-    if (error) { if (error.code === "PGRST301" || error.code === "42501" || /JWT/i.test(error.message || "")) return lockOut("Bitte erneut anmelden."); setStatus("readonly", "Getrennt"); return; }
-    const m = new Map(); for (const r of data) m.set(r.id, fromRow(r));
+    const seq = ++loadSeq, rows = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await sb.from("kalender_termine").select("*").order("date").order("id").range(from, from + PAGE - 1);
+      if (seq !== loadSeq) return;
+      if (error) { if (loggedOut(error)) return lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); setStatus("readonly", "Getrennt"); return; }
+      rows.push(...data);
+      if (data.length < PAGE) break;
+    }
+    if (document.body.classList.contains("locked")) return;
+    const m = new Map(); for (const r of rows) m.set(r.id, fromRow(r));
     state.events = m; state.loaded = true; state.canWrite = true;
     setStatus("live", "Live · für alle sichtbar"); $("banner").hidden = true;
     if (dlg.open && editingId && !m.has(editingId)) { dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
@@ -442,9 +466,13 @@
     if (channel) return;
     channel = sb.channel("termine-live")
       .on("postgres_changes", { event: "*", schema: "public", table: "kalender_termine" }, () => { clearTimeout(refetchT); refetchT = setTimeout(loadAll, 250); })
-      .subscribe();
+      .subscribe((st) => {
+        // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
+        if (st === "SUBSCRIBED") loadAll();
+        else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") setStatus("readonly", "Getrennt");
+      });
   }
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && sb && state.loaded) loadAll(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && sb && !document.body.classList.contains("locked")) loadAll(); });
 
   // Anmeldung gilt höchstens 30 Tage auf einem Gerät, danach muss das Passwort neu eingegeben werden.
   const MAX_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -453,7 +481,7 @@
 
   function clearData() {
     if (channel) { sb.removeChannel(channel); channel = null; }
-    clearTimeout(refetchT);
+    clearTimeout(refetchT); loadSeq++;
     if (dlg.open) dlg.close();
     state.events = new Map(); state.loaded = false; state.canWrite = false; state.person = "";
     render();
@@ -467,9 +495,12 @@
   }
   async function lockOut(msg) {
     loginStamp.set(0);
-    try { await sb.auth.signOut({ scope: "local" }); } catch {}
     showLogin(msg);
+    let failed = true;
+    try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
+    if (failed) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
   }
+  const teamUser = (s) => !!s && (s.user?.email || "").toLowerCase() === String(CFG.email).toLowerCase();
   async function enter() {
     document.body.classList.remove("locked");
     startLive();
@@ -477,12 +508,14 @@
   }
   $("loginForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    if (!sb) return;
     const pw = $("loginPw").value;
     if (!pw) { $("loginErr").textContent = "Bitte das Passwort eingeben."; return; }
     $("loginBtn").disabled = true; $("loginErr").textContent = "";
-    let error = null;
-    try { ({ error } = await sb.auth.signInWithPassword({ email: CFG.email, password: pw })); } catch (e) { error = e; }
-    $("loginBtn").disabled = false;
+    let error = null, data = null;
+    try { ({ data, error } = await sb.auth.signInWithPassword({ email: CFG.email, password: pw })); } catch (e) { error = e; }
+    finally { $("loginBtn").disabled = false; }
+    if (!error && !teamUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return; }
     if (error) {
       const msg = error.status === 429 ? "Zu viele Versuche. Bitte ein paar Minuten warten."
         : /invalid/i.test(error.message || "") ? "Das Passwort stimmt nicht."
@@ -497,11 +530,18 @@
   $("logoutBtn").addEventListener("click", () => lockOut());
 
   (async () => {
-    if (!sb) { setStatus("readonly", "Offline"); $("bannerText").textContent = "Der Kalender konnte nicht geladen werden. Prüfe die Internetverbindung und lade die Seite neu."; $("banner").hidden = false; return; }
+    if (!sb) {
+      setStatus("readonly", "Offline");
+      $("loginErr").textContent = "Der Kalender konnte nicht geladen werden. Prüfe die Internetverbindung und lade die Seite neu.";
+      $("loginBtn").disabled = true;
+      return;
+    }
+    // Rückruf bleibt synchron: ein await auf sb.auth hier würde die Anmeldung blockieren.
     sb.auth.onAuthStateChange((event) => { if (event === "SIGNED_OUT" && !document.body.classList.contains("locked")) showLogin("Bitte erneut anmelden."); });
     const { data } = await sb.auth.getSession();
     const stamp = loginStamp.get();
-    if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) enter();
+    if (data.session && !teamUser(data.session)) lockOut();
+    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) enter();
     else if (data.session) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
     else showLogin();
   })();

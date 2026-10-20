@@ -140,7 +140,8 @@
   size2d();
   try { three = init3d(); } catch (e) { three = null; }
   start();
-  addEventListener("resize", () => { size2d(); if (three) three.resize(); if (reduce.matches) frame(STILL); });
+  // Nach dem Größenwechsel sofort neu zeichnen, sonst blitzt eine leere Fläche auf.
+  addEventListener("resize", () => { size2d(); if (three) three.resize(); frame(reduce.matches || document.hidden ? STILL : (performance.now() - t0) / 1000); });
   document.addEventListener("visibilitychange", start);
   reduce.addEventListener("change", start);
   darkQ.addEventListener("change", () => { if (reduce.matches) frame(STILL); });
