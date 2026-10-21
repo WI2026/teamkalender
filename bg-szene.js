@@ -95,7 +95,8 @@
       L.push(`    if (sh > ${f(1 - (s.share || 0.035))}) { vec2 so = vec2(hash(sc + 3.7), hash(sc + 9.1)) * 0.6 + 0.2;`);
       L.push(`      float sd = length(fract(sp) - so); float tw = 0.55 + 0.45 * sin(uT * (0.7 + 1.6 * hash(sc + 1.3)) + sh * 40.0);`);
       L.push(`      float dark = 1.0 - smoothstep(0.12, 0.35, dot(col, vec3(0.299, 0.587, 0.114)));`);
-      L.push(`      col += vec3(0.9, 0.94, 1.0) * smoothstep(0.09, 0.0, sd) * tw * m.r * dark * ${f(s.amount || 0.7)}; } }`);
+      const free = s.cloudsInB ? " * (1.0 - m.b)" : "";   // Kanal B markiert die Wolken: dort keine Sterne
+      L.push(`      col += vec3(0.9, 0.94, 1.0) * smoothstep(0.09, 0.0, sd) * tw * m.r${free} * dark * ${f(s.amount || 0.7)}; } }`);
     }
     (c.leds || []).forEach((led) => {
       // LED: Glühen um die Stelle im Foto; "aus" dunkelt die LED leicht ab, "an" legt Licht darauf
@@ -206,11 +207,12 @@
       kind: "webgl",
       ready: () => !!(tImg && cur),
       setImages(v, img, mask) {
-        if (gl.isContextLost()) return;
-        let p; try { p = program(v); } catch (e) { return; }   // Variante lässt sich nicht bauen: alte bleibt stehen
+        if (gl.isContextLost()) return false;
+        let p; try { p = program(v); } catch (e) { return false; }   // Variante lässt sich nicht bauen: alte bleibt stehen
         if (tImg) gl.deleteTexture(tImg);
         if (tMask) gl.deleteTexture(tMask);
         tImg = texFrom(img, 0); tMask = mask ? texFrom(mask, 1) : null; cur = p;
+        return true;
       },
       size(bw, bh) { if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; } },
       draw(p) {
@@ -247,7 +249,7 @@
     return {
       kind: "2d",
       ready: () => !!img,
-      setImages(v, i) { img = i; key = ""; },
+      setImages(v, i) { img = i; key = ""; return true; },
       size(bw, bh) { if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; key = ""; } },
       draw(p) {
         if (!img) return;
@@ -267,14 +269,15 @@
   }
 
   function makeScene(cfg, { canvas2d, canvas3d }) {
-    const R = createGL(canvas3d, cfg.wide) || create2D(canvas2d);
+    // gleich das Programm der Variante bauen, die gezeigt wird; die andere entsteht erst beim Drehen
+    const R = createGL(canvas3d, cfg.tall && isPhoneLike(innerWidth, innerHeight) ? cfg.tall : cfg.wide) || create2D(canvas2d);
     if (!R) return null;
     const on = R.kind === "webgl" ? canvas3d : canvas2d, off = R.kind === "webgl" ? canvas2d : canvas3d;
     off.style.display = "none"; on.style.display = "";
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     on.style.opacity = "0";
     on.style.transition = reduce ? "none" : "opacity 900ms cubic-bezier(0.23, 1, 0.32, 1)";
-    let disposed = false, last = null, want = null, v = null, asp = 16 / 9, scale = 1;
+    let disposed = false, last = null, want = null, v = null, asp = 16 / 9, scale = 1, tries = 0, retryT = 0, toneT = 0;
     // Dunkles Foto (Abendszene): Kopfzeile und Werkzeugleiste stehen direkt darauf und werden hell (style.css,
     // data-bg-ton), der Schleier bleibt Navy und die Browserleiste färbt sich passend. Erst wenn das Foto da ist.
     const night = cfg.tone === "dunkel", root = document.documentElement;
@@ -287,24 +290,34 @@
     // Beim Drucken fehlt das Foto (style.css), die Kopfzeile braucht dann wieder ihre normalen Farben
     const beforePrint = () => tone(false), afterPrint = () => { if (!disposed && v) tone(true); };
     addEventListener("beforeprint", beforePrint); addEventListener("afterprint", afterPrint);
-    // Hochformat-Foto, wenn es eins gibt und der Bildschirm hoch ist (Handy); sonst das Querformat
-    const variantFor = (w, h) => (cfg.tall && isPhoneLike(w, h) ? cfg.tall : cfg.wide);
+    // Hochformat-Foto, wenn es eins gibt und der Bildschirm hoch ist (Handy); sonst das Querformat. Zwischen den
+    // Schwellen bleibt das aktuelle Foto, damit eine Tastatur, die nur die Höhe verkleinert, nicht das Foto tauscht.
+    const variantFor = (w, h) => {
+      if (!cfg.tall) return cfg.wide;
+      const r = w / h, now = want || v;
+      return now === cfg.tall ? (r < 1 ? cfg.tall : cfg.wide) : (isPhoneLike(w, h) ? cfg.tall : cfg.wide);
+    };
     function pick(w, h) {
       const nv = variantFor(w, h);
-      if (nv === want) return; want = nv;
+      if (nv === want) return; want = nv; clearTimeout(retryT);
       Promise.all([loadImage(nv.img), nv.mask ? loadImage(nv.mask) : Promise.resolve(null)]).then(([im, mk]) => {
-        if (disposed || want !== nv) return;
-        R.setImages(nv, im, mk);
-        v = nv; asp = im.naturalWidth / im.naturalHeight;
+        if (disposed || want !== nv || !R.setImages(nv, im, mk)) return;
+        tries = 0; v = nv; asp = im.naturalWidth / im.naturalHeight;
         if (last) draw(last);
-        tone(true);
-        requestAnimationFrame(() => { on.style.opacity = "1"; });
-      }).catch(() => { /* ohne Foto bleibt der Farbverlauf der Seite stehen */ });
+        // Helle Kopfzeile erst, wenn das Foto halb eingeblendet ist; vorher stünde helle Schrift auf hellem Verlauf
+        requestAnimationFrame(() => { on.style.opacity = "1"; clearTimeout(toneT); toneT = setTimeout(() => { if (!disposed) tone(true); }, reduce ? 0 : 120); });
+      }).catch(() => {
+        // Ohne Foto bleibt der Farbverlauf der Seite stehen. Später noch einmal versuchen, etwa nach einem Funkloch.
+        if (disposed || want !== nv) return;
+        want = null;
+        if (tries < 3) retryT = setTimeout(() => { if (!disposed && last) pick(last.w, last.h); }, [8000, 30000, 120000][tries++]);
+      });
     }
     function layout(st) {
       const w = Math.max(1, st.w), h = Math.max(1, st.h), dpr = Math.min(window.devicePixelRatio || 1, 3);
-      const ph = isPhoneLike(w, h);
-      const crop = cropFor(w, h, asp, (ph && v.focusPhone) || v.focus || [0.5, 0.5], ph ? v.zoomPhone : v.zoom);
+      const ph = cfg.tall ? v === cfg.tall : isPhoneLike(w, h);
+      const sh = ph && v.short && h < v.short.below ? v.short : null;   // niedriges Handyfenster, etwa Safari mit Leisten
+      const crop = cropFor(w, h, asp, (sh && sh.focus) || (ph && v.focusPhone) || v.focus || [0.5, 0.5], sh ? sh.zoom : ph ? v.zoomPhone : v.zoom);
       // Nicht feiner zeichnen, als das Foto Pixel hat (höchstens 1,6 Megapixel): spart auf Handys viel Rechenzeit und Akku
       const srcPx = (v.px || 1680 * 944) * crop[2] * crop[3];
       scale = clamp(Math.sqrt(Math.min(1.6e6, Math.max(srcPx * 1.2, w * h * 0.5)) / (w * h)), 0.4, dpr);
@@ -318,12 +331,12 @@
         veil: navy ? VEIL.dark : VEIL.light, veilA: navy ? 0.62 : 0.7, veilH: (phone ? 150 : 96) * scale });
     }
     return {
-      fps: cfg.fps || 24,
+      fps: R.kind === "webgl" ? (cfg.fps || 24) : 0,   // 0: Standbild ohne WebGL, der Rahmen zeichnet nur bei Änderungen
       stillT: cfg.stillT || 7,
-      resize(st) { last = st; pick(st.w, st.h); draw(st); },
+      resize(st) { last = st; pick(st.w, st.h); },   // gezeichnet wird danach mit dem richtigen Zeitpunkt (frame)
       frame(st) { last = st; draw(st); },
       dispose() {
-        disposed = true; R.dispose(); tone(false);
+        disposed = true; clearTimeout(retryT); clearTimeout(toneT); R.dispose(); tone(false);
         removeEventListener("beforeprint", beforePrint); removeEventListener("afterprint", afterPrint);
         on.style.opacity = ""; on.style.transition = "";
       },
@@ -352,24 +365,25 @@
     wide: {
       img: B + "wallbox-abend.webp", mask: B + "wallbox-abend-maske.png", px: 1600 * 899,
       focus: [0.613, 0.667, 0.72, 0.6],   // Wallbox rechts neben der Anmeldekarte
-      sky: { dir: [1, 0], amount: 0.03, period: 90 },
-      stars: { amount: 0.8, share: 0.03, density: 110 },
+      sky: { dir: [1, 0], amount: 0.012, period: 40 },
+      stars: { amount: 0.8, share: 0.03, density: 110, cloudsInB: true },
       ripple: { freq: 160, speed: 1.1, amount: 0.0016 },
       leds: [
-        { p: [0.6128, 0.6674], r: 0.009, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.55, dim: 0.25 },
-        { p: [0.6128, 0.6674], r: 0.035, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.08, dim: 0 },
+        { p: [0.6128, 0.6735], r: 0.009, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.55, dim: 0.25 },
+        { p: [0.6128, 0.6735], r: 0.035, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.08, dim: 0 },
       ],
     },
     tall: {
       // px: echte Bildschärfe des Hochformats (449 × 799, doppelt hochgerechnet); feiner zu zeichnen kostet nur Akku
       img: B + "wallbox-abend-hoch.webp", mask: B + "wallbox-abend-hoch-maske.png", px: 449 * 799 * 2,
       focus: [0.6, 0.754, 0.5, 0.8], zoomPhone: 1.08,   // Wallbox knapp unter der Anmeldekarte
-      sky: { dir: [1, 0], amount: 0.03, period: 90 },
-      stars: { amount: 0.8, share: 0.03, density: 110 },
+      short: { below: 760, focus: [0.6, 0.754, 0.5, 0.87], zoom: 1.2 },   // niedrige Handyfenster: Wallbox tiefer
+      sky: { dir: [1, 0], amount: 0.012, period: 40 },
+      stars: { amount: 0.8, share: 0.03, density: 110, cloudsInB: true },
       ripple: { freq: 160, speed: 1.1, amount: 0.0016 },
       leds: [
-        { p: [0.6027, 0.754], r: 0.0055, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.55, dim: 0.25 },
-        { p: [0.6027, 0.754], r: 0.02, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.08, dim: 0 },
+        { p: [0.602, 0.7566], r: 0.0055, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.55, dim: 0.25 },
+        { p: [0.602, 0.7566], r: 0.02, color: WB_GREEN, mode: "pulse", period: 4, amount: 0.08, dim: 0 },
       ],
     },
   });

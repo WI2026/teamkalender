@@ -66,23 +66,36 @@
     if (now - last < 1000 / Math.min(30, scene.fps || 30) - 4) return;
     last = now; draw(false);
   }
+  // Kalender offen auf dem Handy: die Karten verdecken das Bild fast ganz, dann steht es still und spart Akku
+  const covered = () => !document.body.classList.contains("locked") && innerWidth < 700;
+  let coveredNow = false;
   function start() {
     cancelAnimationFrame(raf); clearInterval(tick);
+    coveredNow = covered();
     if (!scene || document.hidden || lost) return;
     // Standbild bei „Bewegung reduzieren“, der Sonnenstand wird trotzdem jede Minute nachgeführt
     if (reduce.matches) { draw(true); tick = setInterval(() => draw(true), 60000); return; }
+    // Szene ohne Bewegung (Foto ohne WebGL) oder verdeckt: einmal zeichnen, und zwar den aktuellen Moment
+    if (!scene.fps || coveredNow) { draw(false); return; }
     raf = requestAnimationFrame(loop);
   }
   const redraw = () => draw(reduce.matches);
   function resize() { if (!scene || lost) return; try { scene.resize(state(0, true)); } catch (e) { fail(e); return; } redraw(); } // sofort zeichnen, sonst blitzt eine leere Fläche auf
 
-  c3.addEventListener("webglcontextlost", (e) => { e.preventDefault(); lost = true; cancelAnimationFrame(raf); clearInterval(tick); });
-  c3.addEventListener("webglcontextrestored", () => setTimeout(() => {
+  c3.addEventListener("webglcontextlost", (e) => {
+    if (c3.style.display === "none") return;   // die Szene zeichnet gerade ohne WebGL (Standbild), das betrifft sie nicht
+    e.preventDefault(); lost = true; cancelAnimationFrame(raf); clearInterval(tick);
+    // Szene gleich abbauen: das Bild ist weg, ihre Einstellungen (etwa helle Kopfzeile) dürfen nicht stehen bleiben
     try { scene && scene.dispose && scene.dispose(); } catch {}
+    scene = null;
+  });
+  c3.addEventListener("webglcontextrestored", () => setTimeout(() => {
+    if (!lost) return;
     make(); lost = !scene;
     if (scene) { resize(); start(); }
   }, 0));
-  addEventListener("resize", resize);
+  addEventListener("resize", () => { resize(); if (covered() !== coveredNow) start(); });
+  new MutationObserver(() => { if (covered() !== coveredNow) start(); }).observe(document.body, { attributes: true, attributeFilter: ["class"] });
   document.addEventListener("visibilitychange", start);
   reduce.addEventListener("change", start);
   darkQ.addEventListener("change", redraw);

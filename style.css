@@ -415,6 +415,11 @@ body.locked .app { display: none; }
 /* Dunkles Hintergrundfoto (Abendszene): Kopfzeile und Werkzeugleiste stehen direkt auf dem Foto und tragen deshalb
    auch im hellen Modus die Farben des Dunkelmodus (Block oben); die Glasflächen darunter bleiben hell */
 :root[data-bg-ton="dunkel"] :is(.top, .toolbar, .banner) { color: var(--fg); color-scheme: dark; }
+/* Kleine Angaben direkt auf dem Foto (KW, Live-Status) eine Stufe kräftiger, sonst reicht der Kontrast über hellem Himmel nicht */
+:root[data-bg-ton="dunkel"] :is(.top .status, .period .kw) { color: var(--fg-2); }
+/* Im hellen Modus liegen die Glaskarten jetzt über einem dunklen Foto: deckender, damit die Schrift darin lesbar bleibt */
+@media (prefers-color-scheme: light) { :root[data-bg-ton="dunkel"]:not([data-theme="dark"]) { --surface: rgba(255,255,255,.9); } }
+:root[data-bg-ton="dunkel"][data-theme="light"] { --surface: rgba(255,255,255,.9); }
 
 /* Hintergrund-Ebenen */
 #bgfx, #bg3d { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
