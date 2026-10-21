@@ -46,7 +46,8 @@
     color-scheme: dark;
   }
 }
-:root[data-theme="dark"] {
+:root[data-theme="dark"],
+:root[data-bg-ton="dunkel"] :is(.top, .toolbar, .banner) {
   --bg: #0b0d14; --wall-1: #1d2348; --wall-2: #3d2018; --wall-3: #1f2d14;
   --surface: rgba(28,28,30,.58); --surface-2: rgba(118,118,128,.24); --solid: #1c1c1e; --glass-edge: rgba(255,255,255,.12);
   --line: rgba(84,84,88,.45); --line-strong: rgba(120,120,128,.6);
@@ -411,6 +412,12 @@ body.locked .app { display: none; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .top .logout { color: var(--fg-2); }
 
+/* Dunkles Hintergrundfoto (Abendszene): Kopfzeile und Werkzeugleiste stehen direkt auf dem Foto und tragen deshalb
+   auch im hellen Modus die Farben des Dunkelmodus (Block oben); die Glasflächen darunter bleiben hell */
+:root[data-bg-ton="dunkel"] :is(.top, .toolbar, .banner) { color: var(--fg); color-scheme: dark; }
+
 /* Hintergrund-Ebenen */
 #bgfx, #bg3d { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
 #bg3d { z-index: -1; }
+/* Gedruckt wird nur der Kalender, ohne Hintergrundbild */
+@media print { #bgfx, #bg3d { display: none !important; } }

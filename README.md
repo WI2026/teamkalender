@@ -4,10 +4,12 @@ Gemeinsamer, passwortgeschützter Terminkalender. Statische Seite auf GitHub Pag
 
 ## Dateien
 - `index.html`, `style.css`, `app.js` – die App
-- `bg.js` – Hintergrund-Animation (three.js)
+- `bg-szene.js` – Hintergrund „Wallbox am Abend“: ein echtes Foto, in dem sich nur wenig ruhig bewegt (Wolken ziehen, Sterne funkeln, der Ring der Wallbox leuchtet wie beim Laden, die nasse Einfahrt schimmert). Ein kleiner WebGL-Shader, ohne WebGL steht das Foto still.
+- `bg/` – Foto im Quer- und Hochformat (Handy) mit je einer Maske, welche Stellen sich bewegen
+- `bg.js` – Rahmen für den Hintergrund: Bildrate, Pause im Hintergrund-Tab, „Bewegung reduzieren“, Dunkelmodus; scheitert die Szene, bleibt der Farbverlauf stehen
 - `mark.svg`, `wordmark.svg`, `icon.svg`, `*.png` – PentaWerk-Zeichen und Schriftzug (PentaWerk ist eine Marke der Wattcon Installation UG)
 - `config.js` – Supabase-Adresse, öffentlicher Schlüssel und Login-Adresse des Team-Kontos
-- `vendor/` – mitgelieferte Bibliotheken (supabase-js 2.45.4, three.js r128), damit keine fremden Server eingebunden werden
+- `vendor/` – mitgelieferte Bibliotheken (supabase-js 2.45.4), damit keine fremden Server eingebunden werden
 
 ## Sicherheit
 - Der öffentliche Schlüssel darf im Quelltext stehen. Ohne Anmeldung mit dem Team-Passwort lässt die Datenbank (Row Level Security) weder Lesen noch Schreiben zu; zugelassen sind nur Konten aus der Tabelle `kalender_zugang`.
