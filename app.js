@@ -111,12 +111,15 @@
     if (rangeHook) rangeHook();
   }
 
+  // Erster angezeigter Montag und Anzahl der Wochen der Monatsansicht.
+  function monthWeeks(c) {
+    const first = new Date(c.getFullYear(), c.getMonth(), 1);
+    return { start: monday(first), weeks: Math.ceil((dowIdx(first) + new Date(c.getFullYear(), c.getMonth() + 1, 0).getDate()) / 7) };
+  }
   function renderMonth() {
     const c = state.cursor, y = c.getFullYear(), m = c.getMonth();
     $("periodTitle").textContent = `${MONTHS[m]} ${y}`;
-    const first = new Date(y, m, 1), start = monday(first);
-    const last = new Date(y, m + 1, 0);
-    const weeks = Math.ceil((dowIdx(first) + last.getDate()) / 7);
+    const { start, weeks } = monthWeeks(c);
     $("periodKw").textContent = `KW ${isoWeek(start)}–${isoWeek(addDays(start, weeks * 7 - 1))}`;
     const grid = el("div", { class: "month", role: "grid", "aria-label": `${MONTHS[m]} ${y}` });
     grid.append(el("div", { class: "dow kwh", title: "Kalenderwoche" }, "KW"));
@@ -152,10 +155,11 @@
   }
 
   function weekStart() { return monday(state.cursor); }
-  // Sichtbarer Zeitraum: Monatsansicht bis zu 6 Wochen, Wochenansicht 7 Tage.
+  // Sichtbarer Zeitraum: die angezeigten Wochen des Monats bzw. die 7 Tage der Woche.
   function visibleRange() {
-    const c = state.cursor, s = state.view === "month" ? monday(new Date(c.getFullYear(), c.getMonth(), 1)) : weekStart();
-    return { from: ymd(s), to: ymd(addDays(s, state.view === "month" ? 41 : 6)) };
+    if (state.view !== "month") { const s = weekStart(); return { from: ymd(s), to: ymd(addDays(s, 6)) }; }
+    const { start, weeks } = monthWeeks(state.cursor);
+    return { from: ymd(start), to: ymd(addDays(start, weeks * 7 - 1)) };
   }
   function setWeekTitle(ws) {
     const we = addDays(ws, 6);
@@ -333,6 +337,8 @@
   const fmtStamp = (iso) => { const d = new Date(tsOf(iso)); return isNaN(d) ? "" : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 
   $("cancelBtn").addEventListener("click", () => dlg.close());
+  // Kundendaten nur so lange im Formular halten, wie es offen ist.
+  dlg.addEventListener("close", () => { $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null; });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
   let delTimer = null;
@@ -376,7 +382,7 @@
       if (state.view === "month" && (d.getMonth() !== state.cursor.getMonth() || d.getFullYear() !== state.cursor.getFullYear())) state.cursor = d;
       if (state.view === "week" && ymd(monday(d)) !== ymd(weekStart())) state.cursor = d;
       render();
-      toast(prev ? "Termin gespeichert" : "Termin eingetragen");
+      if (!document.body.classList.contains("locked")) toast(prev ? "Termin gespeichert" : "Termin eingetragen");
     } catch (e2) { $("formErr").textContent = writeError(e2); }
     finally { $("saveBtn").disabled = false; }
   });
@@ -437,16 +443,21 @@
   const fromRow = (r) => ({ title: r.title, date: r.date, allDay: !!r.all_day, start: r.start_time || "", end: r.end_time || "",
     person: r.person || "", note: r.note || "", cat: r.cat || "buero", createdAt: r.created_at, updatedAt: r.updated_at });
   const toRow = (b) => ({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
-    person: b.person, note: b.note || null, cat: b.cat, updated_at: new Date().toISOString() });
+    person: b.person, note: b.note || null, cat: b.cat });
   const check = ({ error }) => { if (error) throw error; };
   const T = "kalender_termine", COLS = "id,title,date,all_day,start_time,end_time,person,note,cat,updated_at";
   const isLocked = () => document.body.classList.contains("locked");
-  // Eine Änderung nur übernehmen, wenn sie nicht älter ist als der bekannte Stand.
+  // Termine, die sich während einer laufenden Abfrage geändert haben; die ältere Abfrage überschreibt sie nicht.
+  let touched = new Set();
+  // Eine Änderung nur übernehmen, wenn sie nicht älter ist als der bekannte Stand (Zeit vergibt die Datenbank).
   function putRow(r) {
+    if (isLocked()) return;
+    touched.add(r.id);
     const cur = state.events.get(r.id);
     if (cur && tsOf(cur.updatedAt) > tsOf(r.updated_at)) return;
     state.events.set(r.id, fromRow(r));
   }
+  function dropRow(id) { if (!id) return; touched.add(id); state.events.delete(id); }
   function afterChange() {
     if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) { dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
     render();
@@ -461,59 +472,77 @@
         const res = await q.select(COLS); check(res);
         if (res.data.length) { putRow(res.data[0]); return; }
         const now = await sb.from(T).select(COLS).eq("id", id).maybeSingle(); check(now);
-        if (now.data) state.events.set(id, fromRow(now.data)); else state.events.delete(id);
+        if (isLocked()) throw { code: "conflict" };
+        if (now.data) putRow(now.data); else dropRow(id);
         afterChange();
         throw { code: "conflict" };
       },
-      delete: async () => { check(await sb.from(T).delete().eq("id", id)); state.events.delete(id); },
+      delete: async () => { check(await sb.from(T).delete().eq("id", id)); dropRow(id); },
     }),
   };
   // Geladen wird nur der sichtbare Zeitraum, damit die Datenmenge auch nach Jahren klein bleibt.
   // Die Datenbank liefert höchstens 1000 Zeilen pro Abfrage, daher seitenweise.
   const PAGE = 1000;
-  let loadSeq = 0, lastRangeKey = "";
+  let loadSeq = 0, lastRangeKey = "", navT = null, retryT = null, retryMs = 5000;
   async function refresh() {
-    const r = visibleRange(), seq = ++loadSeq, rows = [];
+    clearTimeout(navT); clearTimeout(retryT);
+    const r = visibleRange(), seq = ++loadSeq, rows = [], seen = touched = new Set();
     lastRangeKey = r.from + r.to;
     for (let from = 0; ; from += PAGE) {
       const { data, error } = await sb.from(T).select(COLS).gte("date", r.from).lte("date", r.to).order("date").order("id").range(from, from + PAGE - 1);
       if (seq !== loadSeq) return;
-      if (error) { if (loggedOut(error)) return lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); setStatus("readonly", "Getrennt"); return; }
+      if (error) {
+        if (loggedOut(error)) return lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
+        // Später erneut versuchen, mit wachsendem Abstand.
+        setStatus("readonly", "Getrennt"); lastRangeKey = "";
+        retryT = setTimeout(() => rangeHook(), retryMs); retryMs = Math.min(retryMs * 2, 120000);
+        return;
+      }
       rows.push(...data);
       if (data.length < PAGE) break;
     }
     if (isLocked()) return;
-    for (const [id, e] of state.events) if (e.date >= r.from && e.date <= r.to) state.events.delete(id);
-    for (const row of rows) state.events.set(row.id, fromRow(row));
-    if (!covered(r.from) || !covered(r.to)) state.ranges.push(r);
+    for (const [id, e] of state.events) if (e.date >= r.from && e.date <= r.to && !seen.has(id)) state.events.delete(id);
+    for (const row of rows) if (!seen.has(row.id)) putRow(row);
+    // Ein offener Termin, der nicht mehr im Zeitraum liegt, wurde vielleicht nur verschoben.
+    if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) {
+      const one = await sb.from(T).select(COLS).eq("id", editingId).maybeSingle();
+      if (seq !== loadSeq || isLocked()) return;
+      if (one.data) putRow(one.data);
+    }
+    if (!state.ranges.some(x => x.from <= r.from && x.to >= r.to)) state.ranges.push(r);
+    retryMs = 5000;
     state.canWrite = true;
     setStatus("live", "Live · für alle sichtbar"); $("banner").hidden = true;
     afterChange();
   }
+  // Beim Blättern kurz warten, damit schnelles Klicken nicht jeden Monat einzeln lädt.
   rangeHook = () => {
     if (!sb || isLocked()) return;
-    const r = visibleRange();
-    if (r.from + r.to !== lastRangeKey) refresh();
+    const r = visibleRange(), k = r.from + r.to;
+    if (k === lastRangeKey) return;
+    lastRangeKey = k; clearTimeout(navT); navT = setTimeout(refresh, 200);
   };
-  let channel = null;
+  addEventListener("online", () => { if (sb && !isLocked()) refresh(); });
+  let channel = null, joined = false, firstT = null;
   function startLive() {
     if (channel) return;
     channel = sb.channel("termine-live")
       // Änderungen der anderen kommen einzeln an, ohne alles neu zu laden.
       .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
         if (isLocked()) return;
-        if (p.eventType === "DELETE") { if (p.old && p.old.id) state.events.delete(p.old.id); }
+        if (p.eventType === "DELETE") dropRow(p.old && p.old.id);
         else if (p.new && p.new.id) putRow(p.new);
         afterChange();
       })
       .subscribe((st) => {
         // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
-        if (st === "SUBSCRIBED") refresh();
-        else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") setStatus("readonly", "Getrennt");
+        if (st === "SUBSCRIBED") { joined = true; clearTimeout(firstT); refresh(); }
+        else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") { setStatus("readonly", "Getrennt"); if (!state.ranges.length && !isLocked()) refresh(); }
       });
   }
   // Nach mehr als einer Minute im Hintergrund den sichtbaren Zeitraum auffrischen.
-  let hiddenAt = 0;
+  let hiddenAt = Date.now();
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { hiddenAt = Date.now(); return; }
     if (sb && !isLocked() && Date.now() - hiddenAt > 60 * 1000) refresh();
@@ -526,7 +555,8 @@
 
   function clearData() {
     if (channel) { sb.removeChannel(channel); channel = null; }
-    loadSeq++; lastRangeKey = "";
+    loadSeq++; lastRangeKey = ""; joined = false; touched = new Set();
+    clearTimeout(navT); clearTimeout(retryT); clearTimeout(firstT); retryMs = 5000;
     if (dlg.open) dlg.close();
     state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = "";
     render();
@@ -549,7 +579,9 @@
   async function enter() {
     document.body.classList.remove("locked");
     startLive();
-    await refresh();
+    // Die erste Ladung kommt mit dem Verbinden der Live-Verbindung; hängt diese, nach 3 s direkt laden.
+    clearTimeout(firstT);
+    firstT = setTimeout(() => { if (!joined && !isLocked()) refresh(); }, 3000);
   }
   $("loginForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
