@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-title" content="Teamkalender">
 <meta name="theme-color" content="#e9eef6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0b0d14" media="(prefers-color-scheme: dark)">
-<title>Wattcon Teamkalender</title>
+<title>PentaWerk Teamkalender</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="manifest" href="manifest.webmanifest">
@@ -25,23 +25,32 @@
 <body class="locked">
 <div class="login" id="login">
   <form class="login-card" id="loginForm" novalidate>
-    <div class="login-icon" aria-hidden="true">
-      <svg viewBox="0 0 48 48" fill="none"><rect x="6" y="9" width="36" height="33" rx="9" fill="var(--solid)"/><path d="M6 18a9 9 0 0 1 9-9h18a9 9 0 0 1 9 9v1H6z" fill="var(--today)"/><text x="24" y="36" text-anchor="middle" font-size="15" font-weight="600" fill="var(--fg)" font-family="-apple-system,'Segoe UI',Roboto,sans-serif" id="loginDay">13</text></svg>
+    <div class="login-brand" aria-hidden="true">
+      <img class="mark" src="mark.svg" alt="" width="72" height="70">
+      <span class="wordmark"></span>
+      <span class="claim">Plan &amp; Handwerk aus einer Hand</span>
     </div>
-    <h1>Wattcon Teamkalender</h1>
+    <h1><span class="sr">PentaWerk </span>Teamkalender</h1>
     <p>Bitte das Team-Passwort eingeben.</p>
     <label class="sr" for="loginPw">Passwort</label>
     <input type="password" id="loginPw" autocomplete="current-password" placeholder="Passwort">
     <div class="err" id="loginErr" role="alert"></div>
     <button class="btn primary" id="loginBtn" type="submit">Öffnen</button>
+    <p class="login-foot">PentaWerk ist eine Marke der Wattcon Installation UG</p>
   </form>
 </div>
 
 <div class="app">
   <div class="top">
     <div class="brand">
-      <h1>Wattcon Teamkalender</h1>
-      <span class="status" id="status" data-state="loading"><i></i><span id="statusText">Verbinde …</span></span>
+      <img class="mark" src="mark.svg" alt="" width="34" height="33">
+      <div class="brand-text">
+        <span class="wordmark" role="img" aria-label="PentaWerk"></span>
+        <div class="brand-sub">
+          <h1><span class="sr">PentaWerk </span>Teamkalender</h1>
+          <span class="status" id="status" data-state="loading"><i></i><span id="statusText">Verbinde …</span></span>
+        </div>
+      </div>
     </div>
     <div class="spacer"></div>
     <button class="btn ghost logout" id="logoutBtn" type="button">Abmelden</button>

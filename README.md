@@ -1,10 +1,11 @@
-# Wattcon Teamkalender
+# PentaWerk Teamkalender
 
 Gemeinsamer, passwortgeschützter Terminkalender. Statische Seite auf GitHub Pages, Termine in Supabase (Region Frankfurt).
 
 ## Dateien
 - `index.html`, `style.css`, `app.js` – die App
 - `bg.js` – Hintergrund-Animation (three.js)
+- `mark.svg`, `wordmark.svg`, `icon.svg`, `*.png` – PentaWerk-Zeichen und Schriftzug (PentaWerk ist eine Marke der Wattcon Installation UG)
 - `config.js` – Supabase-Adresse, öffentlicher Schlüssel und Login-Adresse des Team-Kontos
 - `vendor/` – mitgelieferte Bibliotheken (supabase-js 2.45.4, three.js r128), damit keine fremden Server eingebunden werden
 

@@ -434,7 +434,6 @@
   });
   setInterval(() => { if (state.view === "week" && !dlg.open) render(); }, 5 * 60 * 1000);
 
-  document.getElementById("loginDay").textContent = new Date().getDate();
   render();
 
   // ---------- Verbindung (Supabase) ----------
