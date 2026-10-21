@@ -68,8 +68,11 @@
     canWrite: false,
     col: null,
     myId: null,
-    loaded: false,
+    ranges: [],
   };
+  // Zeitraum ist geladen, wenn ein bereits abgefragter Bereich ihn enthält.
+  const covered = (ds) => state.ranges.some(r => ds >= r.from && ds <= r.to);
+  let rangeHook = null;
   const $ = (id) => document.getElementById(id);
   function el(tag, attrs, ...kids) {
     const n = document.createElement(tag);
@@ -105,6 +108,7 @@
     renderAgenda();
     renderFilter();
     $("newBtn").disabled = !state.canWrite;
+    if (rangeHook) rangeHook();
   }
 
   function renderMonth() {
@@ -148,6 +152,11 @@
   }
 
   function weekStart() { return monday(state.cursor); }
+  // Sichtbarer Zeitraum: Monatsansicht bis zu 6 Wochen, Wochenansicht 7 Tage.
+  function visibleRange() {
+    const c = state.cursor, s = state.view === "month" ? monday(new Date(c.getFullYear(), c.getMonth(), 1)) : weekStart();
+    return { from: ymd(s), to: ymd(addDays(s, state.view === "month" ? 41 : 6)) };
+  }
   function setWeekTitle(ws) {
     const we = addDays(ws, 6);
     const sameM = ws.getMonth() === we.getMonth();
@@ -248,7 +257,7 @@
       el("div", null, el("h3", null, longDate(d)),
         el("div", { class: "sub" }, `${d.getFullYear()} · KW ${isoWeek(d)}`, hol ? [" · ", el("span", { class: "h" }, hol)] : null)),
       state.canWrite ? el("button", { class: "btn icon", type: "button", "aria-label": "Termin an diesem Tag anlegen", onclick: () => openEditor(null, state.selected) }, svgPlus()) : null));
-    if (!state.loaded) kids.push(el("div", { class: "empty" }, "Termine werden geladen …"));
+    if (!covered(state.selected)) kids.push(el("div", { class: "empty" }, "Termine werden geladen …"));
     else if (evs.length) kids.push(el("div", { class: "items" }, evs.map(itemCard)));
     else kids.push(el("div", { class: "empty" },
       el("span", null, state.person ? "Keine Termine dieser Person an diesem Tag." : "An diesem Tag ist noch nichts eingetragen."),
@@ -282,7 +291,7 @@
 
   // ---------- Editor ----------
   const dlg = $("dlg");
-  let editingId = null, editingStamp = null;
+  let editingId = null, editingStamp = null, deletingId = null;
   $("cats").replaceChildren(...CATS.map((c, i) => el("label", { style: `--c:${catColor(c.id)}` },
     el("input", { type: "radio", name: "cat", value: c.id, id: `cat-${c.id}`, checked: i === 0 }), c.label)));
   const syncAllDay = () => { $("timeRow").hidden = $("f-allday").checked; };
@@ -319,7 +328,9 @@
     $("cancelBtn").autofocus = ro || !!e;
     dlg.showModal();
   }
-  const fmtStamp = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  // Zeitstempel kommen je nach Weg als "…T…+00:00" oder "… …+00"
+  const tsOf = (v) => Date.parse(String(v || "").replace(" ", "T").replace(/([+-]\d\d)$/, "$1:00"));
+  const fmtStamp = (iso) => { const d = new Date(tsOf(iso)); return isNaN(d) ? "" : `${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 
   $("cancelBtn").addEventListener("click", () => dlg.close());
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
@@ -334,10 +345,10 @@
     }
     disarmDelete();
     const id = editingId;
-    b.disabled = true;
-    try { await state.col.doc(id).delete(); dlg.close(); toast("Termin gelöscht"); }
+    b.disabled = true; deletingId = id;
+    try { await state.col.doc(id).delete(); dlg.close(); render(); toast("Termin gelöscht"); }
     catch (err) { $("formErr").textContent = writeError(err); }
-    finally { b.disabled = false; }
+    finally { b.disabled = false; deletingId = null; }
   });
 
   $("form").addEventListener("submit", async (ev) => {
@@ -428,51 +439,85 @@
   const toRow = (b) => ({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
     person: b.person, note: b.note || null, cat: b.cat, updated_at: new Date().toISOString() });
   const check = ({ error }) => { if (error) throw error; };
+  const T = "kalender_termine", COLS = "id,title,date,all_day,start_time,end_time,person,note,cat,updated_at";
+  const isLocked = () => document.body.classList.contains("locked");
+  // Eine Änderung nur übernehmen, wenn sie nicht älter ist als der bekannte Stand.
+  function putRow(r) {
+    const cur = state.events.get(r.id);
+    if (cur && tsOf(cur.updatedAt) > tsOf(r.updated_at)) return;
+    state.events.set(r.id, fromRow(r));
+  }
+  function afterChange() {
+    if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) { dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
+    render();
+  }
   state.col = {
-    add: async (b) => { check(await sb.from("kalender_termine").insert(toRow(b))); await loadAll(); },
+    add: async (b) => { const res = await sb.from(T).insert(toRow(b)).select(COLS).single(); check(res); putRow(res.data); },
     doc: (id) => ({
       // Nur speichern, wenn niemand den Termin seit dem Öffnen geändert hat.
       set: async (b, stamp) => {
-        let q = sb.from("kalender_termine").update(toRow(b)).eq("id", id);
+        let q = sb.from(T).update(toRow(b)).eq("id", id);
         if (stamp) q = q.eq("updated_at", stamp);
-        const res = await q.select("id"); check(res);
-        if (!res.data.length) { await loadAll(); throw { code: "conflict" }; }
-        await loadAll();
+        const res = await q.select(COLS); check(res);
+        if (res.data.length) { putRow(res.data[0]); return; }
+        const now = await sb.from(T).select(COLS).eq("id", id).maybeSingle(); check(now);
+        if (now.data) state.events.set(id, fromRow(now.data)); else state.events.delete(id);
+        afterChange();
+        throw { code: "conflict" };
       },
-      delete: async () => { check(await sb.from("kalender_termine").delete().eq("id", id)); await loadAll(); },
+      delete: async () => { check(await sb.from(T).delete().eq("id", id)); state.events.delete(id); },
     }),
   };
-  // Die Datenbank liefert höchstens 1000 Zeilen pro Abfrage, daher seitenweise laden.
+  // Geladen wird nur der sichtbare Zeitraum, damit die Datenmenge auch nach Jahren klein bleibt.
+  // Die Datenbank liefert höchstens 1000 Zeilen pro Abfrage, daher seitenweise.
   const PAGE = 1000;
-  let loadSeq = 0;
-  async function loadAll() {
-    const seq = ++loadSeq, rows = [];
+  let loadSeq = 0, lastRangeKey = "";
+  async function refresh() {
+    const r = visibleRange(), seq = ++loadSeq, rows = [];
+    lastRangeKey = r.from + r.to;
     for (let from = 0; ; from += PAGE) {
-      const { data, error } = await sb.from("kalender_termine").select("*").order("date").order("id").range(from, from + PAGE - 1);
+      const { data, error } = await sb.from(T).select(COLS).gte("date", r.from).lte("date", r.to).order("date").order("id").range(from, from + PAGE - 1);
       if (seq !== loadSeq) return;
       if (error) { if (loggedOut(error)) return lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); setStatus("readonly", "Getrennt"); return; }
       rows.push(...data);
       if (data.length < PAGE) break;
     }
-    if (document.body.classList.contains("locked")) return;
-    const m = new Map(); for (const r of rows) m.set(r.id, fromRow(r));
-    state.events = m; state.loaded = true; state.canWrite = true;
+    if (isLocked()) return;
+    for (const [id, e] of state.events) if (e.date >= r.from && e.date <= r.to) state.events.delete(id);
+    for (const row of rows) state.events.set(row.id, fromRow(row));
+    if (!covered(r.from) || !covered(r.to)) state.ranges.push(r);
+    state.canWrite = true;
     setStatus("live", "Live · für alle sichtbar"); $("banner").hidden = true;
-    if (dlg.open && editingId && !m.has(editingId)) { dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
-    render();
+    afterChange();
   }
-  let channel = null, refetchT = null;
+  rangeHook = () => {
+    if (!sb || isLocked()) return;
+    const r = visibleRange();
+    if (r.from + r.to !== lastRangeKey) refresh();
+  };
+  let channel = null;
   function startLive() {
     if (channel) return;
     channel = sb.channel("termine-live")
-      .on("postgres_changes", { event: "*", schema: "public", table: "kalender_termine" }, () => { clearTimeout(refetchT); refetchT = setTimeout(loadAll, 250); })
+      // Änderungen der anderen kommen einzeln an, ohne alles neu zu laden.
+      .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
+        if (isLocked()) return;
+        if (p.eventType === "DELETE") { if (p.old && p.old.id) state.events.delete(p.old.id); }
+        else if (p.new && p.new.id) putRow(p.new);
+        afterChange();
+      })
       .subscribe((st) => {
         // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
-        if (st === "SUBSCRIBED") loadAll();
+        if (st === "SUBSCRIBED") refresh();
         else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") setStatus("readonly", "Getrennt");
       });
   }
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && sb && !document.body.classList.contains("locked")) loadAll(); });
+  // Nach mehr als einer Minute im Hintergrund den sichtbaren Zeitraum auffrischen.
+  let hiddenAt = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { hiddenAt = Date.now(); return; }
+    if (sb && !isLocked() && Date.now() - hiddenAt > 60 * 1000) refresh();
+  });
 
   // Anmeldung gilt höchstens 30 Tage auf einem Gerät, danach muss das Passwort neu eingegeben werden.
   const MAX_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -481,14 +526,14 @@
 
   function clearData() {
     if (channel) { sb.removeChannel(channel); channel = null; }
-    clearTimeout(refetchT); loadSeq++;
+    loadSeq++; lastRangeKey = "";
     if (dlg.open) dlg.close();
-    state.events = new Map(); state.loaded = false; state.canWrite = false; state.person = "";
+    state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = "";
     render();
   }
   function showLogin(msg) {
-    clearData();
     document.body.classList.add("locked");
+    clearData();
     $("loginErr").textContent = msg || "";
     $("loginPw").value = "";
     setTimeout(() => $("loginPw").focus(), 50);
@@ -504,7 +549,7 @@
   async function enter() {
     document.body.classList.remove("locked");
     startLive();
-    await loadAll();
+    await refresh();
   }
   $("loginForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
