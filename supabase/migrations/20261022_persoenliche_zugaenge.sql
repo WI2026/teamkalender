@@ -129,7 +129,8 @@ begin
                                       where p.admin and p.user_id is not null) then
     return;
   end if;
-  update privat.kalender_stand set team_verwaltung_bis = now();
+  -- Mit WHERE: Aufrufe über die Schnittstelle laufen mit safeupdate, das UPDATE ohne WHERE ablehnt
+  update privat.kalender_stand set team_verwaltung_bis = now() where eine;
   update privat.kalender_personen set code_hash = null, code_bis = null
    where admin and code_vom_team and code_hash is not null;
   get diagnostics n = row_count;
