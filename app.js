@@ -687,6 +687,13 @@
   // Jede Person meldet sich mit ihrem Namen und eigenem Passwort an. Das erste Passwort legt sie mit einem Einmal-Code fest,
   // den die Verwaltung im Kalender erzeugt (Server-Funktion kalender-zugang). Bis alle umgestellt sind, gibt es den Team-Zugang.
   const FN = CFG.url ? CFG.url + "/functions/v1/kalender-zugang" : "";
+  // Ohne Antwort nach einiger Zeit aufgeben, statt endlos zu warten (schwaches Netz auf der Baustelle)
+  const within = (promise, ms) => new Promise((ok, no) => { const t = setTimeout(() => no(new Error("Zeit abgelaufen")), ms); promise.then(v => { clearTimeout(t); ok(v); }, e => { clearTimeout(t); no(e); }); });
+  function postFn(body, headers) {
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 20000);
+    return fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key, ...headers }, body: JSON.stringify(body), signal: ctl.signal })
+      .finally(() => clearTimeout(t));
+  }
   let names = [], namesT = null, namesSeq = 0;
   async function loadNames() {
     clearTimeout(namesT);
@@ -792,8 +799,7 @@
     $("setupBtn").disabled = true; $("setupErr").textContent = "";
     let res = null, out = null;
     try {
-      res = await fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key },
-        body: JSON.stringify({ aktion: "einrichten", code, passwort: pw }) });
+      res = await postFn({ aktion: "einrichten", code, passwort: pw });
       out = await res.json().catch(() => null);
     } catch {}
     if (!res || !res.ok || !out || !out.ok || !out.email) {
@@ -820,14 +826,14 @@
   const teamDlg = $("teamDlg");
   async function teamCall(body) {
     let s;
-    try { s = await sb.auth.getSession(); } catch { throw { status: 0 }; }
-    // Erneuern ohne Netz schlägt fehl, ist aber kein Abmelden
+    // Erneuern ohne Netz schlägt fehl oder dauert, ist aber kein Abmelden
+    try { s = await within(sb.auth.getSession(), 10000); } catch { throw { status: 0 }; }
     if (s.error) throw { status: 0 };
     const tok = s.data && s.data.session && s.data.session.access_token;
     if (!tok) throw { status: 401 };
     let res;
     try {
-      res = await fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key, Authorization: "Bearer " + tok }, body: JSON.stringify(body) });
+      res = await postFn(body, { Authorization: "Bearer " + tok });
     } catch { throw { status: 0 }; }
     const out = await res.json().catch(() => ({}));
     if (!res.ok) throw { status: res.status, fehler: out && out.fehler };
