@@ -69,6 +69,8 @@
     col: null,
     myId: null,
     ranges: [],
+    pdfBusy: false,
+    me: null,   // { name, admin, team } aus der Datenbank
   };
   // Zeitraum ist geladen, wenn ein bereits abgefragter Bereich ihn enthält.
   const covered = (ds) => state.ranges.some(r => ds >= r.from && ds <= r.to);
@@ -108,6 +110,7 @@
     renderAgenda();
     renderFilter();
     $("newBtn").disabled = !state.canWrite;
+    $("pdfBtn").disabled = !state.canWrite || state.pdfBusy;
     if (rangeHook) rangeHook();
   }
 
@@ -316,7 +319,7 @@
     $("f-allday").checked = !!(e && e.allDay);
     $("f-start").value = e && !e.allDay ? e.start : (start || "08:00");
     $("f-end").value = e && !e.allDay ? e.end : (end || "09:00");
-    $("f-person").value = e ? (e.person || "") : (store.get("kal.name") || state.myName || "");
+    $("f-person").value = e ? (e.person || "") : ((state.me && state.me.name) || store.get("kal.name") || "");
     $("f-note").value = e ? (e.note || "") : "";
     const cat = e && CATS.some(c => c.id === e.cat) ? e.cat : "baustelle";
     $(`cat-${cat}`).checked = true;
@@ -341,14 +344,15 @@
   dlg.addEventListener("close", () => { $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null; });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
-  let delTimer = null;
+  let delTimer = null, delAb = 0;
   function disarmDelete() { clearTimeout(delTimer); const b = $("delBtn"); b.classList.remove("armed"); b.textContent = "Löschen"; }
   $("delBtn").addEventListener("click", async () => {
     const b = $("delBtn");
     if (!b.classList.contains("armed")) {
-      b.classList.add("armed"); b.textContent = "Wirklich löschen?";
+      b.classList.add("armed"); b.textContent = "Wirklich löschen?"; delAb = performance.now();
       delTimer = setTimeout(disarmDelete, 4000); return;
     }
+    if (performance.now() - delAb < 500) return;
     disarmDelete();
     const id = editingId;
     b.disabled = true; deletingId = id;
@@ -405,7 +409,8 @@
   function toast(msg) { const t = $("toast"); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, 2200); }
 
   // ---------- Status ----------
-  function setStatus(s, text) { $("status").dataset.state = s; $("statusText").textContent = text; }
+  // Der Zusatz steht auf dem Handy nicht da, damit Name und Abmelden neben die Marke passen
+  function setStatus(s, text, more) { $("status").dataset.state = s; $("statusText").replaceChildren(text, ...(more ? [el("span", { class: "wide" }, " · " + more)] : [])); }
 
   // ---------- Navigation ----------
   function shift(n) {
@@ -512,8 +517,10 @@
     if (!state.ranges.some(x => x.from <= r.from && x.to >= r.to)) state.ranges.push(r);
     retryMs = 5000;
     state.canWrite = true;
-    setStatus("live", "Live · für alle sichtbar"); $("banner").hidden = true;
+    setStatus("live", "Live", "für alle sichtbar"); $("banner").hidden = true;
     afterChange();
+    // Ein entzogener Zugang liefert keine Fehler, sondern nur noch leere Monate. Daher regelmäßig nachfragen.
+    if (Date.now() - meAt > 60 * 1000) checkMe();
   }
   // Beim Blättern kurz warten, damit schnelles Klicken nicht jeden Monat einzeln lädt.
   rangeHook = () => {
@@ -523,6 +530,67 @@
     lastRangeKey = k; clearTimeout(navT); navT = setTimeout(refresh, 200);
   };
   addEventListener("online", () => { if (sb && !isLocked()) refresh(); });
+
+  // ---------- PDF ----------
+  // Alle Termine ab dem Ersten des laufenden Monats als PDF, damit man sie auch ohne Internet nachsehen kann.
+  // Ist oben eine Person gewählt, nur deren Termine. Geladen wird einmal beim Klick, nicht laufend.
+  const PDF_COLOR = { baustelle: "#df4505", kunde: "#1f56c2", buero: "#8a8a94", abwesend: "#7fa23a" };
+  async function exportPdf() {
+    if (!sb || isLocked() || !window.KalPDF) return;
+    state.pdfBusy = true; $("pdfBtn").disabled = true;
+    try {
+      // Erst prüfen, ob der Zugang noch besteht; sonst entstünde ein leeres PDF, das wie ein leerer Kalender aussieht.
+      if (await checkMe() === "weg") return;
+      const now = new Date(), first = new Date(now.getFullYear(), now.getMonth(), 1), got = new Map();
+      // Seitenweise nach (Datum, id) weiterlesen: so fehlt kein Termin und keiner kommt doppelt, auch wenn gerade jemand ändert.
+      for (let last = null; ;) {
+        let q = sb.from(T).select(COLS).gte("date", ymd(first)).order("date").order("id").limit(PAGE);
+        if (last) q = q.or(`date.gt.${last.date},and(date.eq.${last.date},id.gt.${last.id})`);
+        const { data, error } = await q;
+        if (error) throw error;
+        for (const r of data) got.set(r.id, r);
+        if (data.length < PAGE) break;
+        last = data[data.length - 1];
+      }
+      if (isLocked()) return;
+      const rows = [...got.values()];
+      const who = state.person, whoName = who ? ($("personFilter").selectedOptions[0] || {}).textContent || who : "";
+      const byDay = new Map();
+      for (const r of rows) {
+        const e = fromRow(r);
+        if (who && e.person.trim().toLowerCase() !== who) continue;
+        if (!byDay.has(e.date)) byDay.set(e.date, []);
+        byDay.get(e.date).push(e);
+      }
+      const order = (a, b) => (b.allDay ? 1 : 0) - (a.allDay ? 1 : 0) || (toMin(a.start) ?? 0) - (toMin(b.start) ?? 0) || String(a.title).localeCompare(String(b.title));
+      let count = 0;
+      const days = [...byDay.keys()].sort().map((ds) => {
+        const d = parse(ds), hol = holidayOf(d), list = byDay.get(ds).sort(order);
+        count += list.length;
+        return { heading: `${longDate(d)} ${d.getFullYear()} · KW ${isoWeek(d)}${hol ? " · " + hol : ""}`,
+          rows: list.map((e) => ({ time: timeLabel(e), title: e.title, meta: `${catLabel(e.cat)} · eingetragen von ${e.person || "–"}`,
+            note: e.note, color: Object.hasOwn(PDF_COLOR, e.cat) ? PDF_COLOR[e.cat] : PDF_COLOR.buero })) };
+      });
+      const stand = `${pad(now.getDate())}.${pad(now.getMonth() + 1)}.${now.getFullYear()}, ${pad(now.getHours())}:${pad(now.getMinutes())} Uhr`;
+      const bytes = window.KalPDF.build({
+        title: "PentaWerk Teamkalender",
+        sub: [`Termine ab 1. ${MONTHS[first.getMonth()]} ${first.getFullYear()} · ${count} ${count === 1 ? "Termin" : "Termine"}${whoName ? " · nur " + whoName : ""}`, `Stand: ${stand}. Spätere Änderungen fehlen in dieser Datei.`],
+        warn: "Vertraulich: enthält Kundendaten. Nur für das Team, nicht weitergeben. Nach Gebrauch löschen.",
+        footer: `PentaWerk Teamkalender · Stand ${stand} · vertraulich`,
+        empty: whoName ? `Keine Termine von ${whoName} ab diesem Monat.` : "Ab diesem Monat sind keine Termine eingetragen.",
+        days,
+      });
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+      const a = el("a", { href: url, download: `Teamkalender_Stand_${ymd(now)}_${pad(now.getHours())}${pad(now.getMinutes())}.pdf` });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast(count ? "PDF wird gespeichert" : whoName ? `PDF gespeichert, ${whoName} hat ab diesem Monat keine Termine` : "PDF gespeichert, ab diesem Monat ist nichts eingetragen");
+    } catch (err) {
+      if (loggedOut(err)) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
+      else toast("PDF ging nicht. Prüfe die Internetverbindung und versuche es erneut.");
+    } finally { state.pdfBusy = false; $("pdfBtn").disabled = !state.canWrite; }
+  }
+  $("pdfBtn").addEventListener("click", exportPdf);
   let channel = null, joined = false, firstT = null;
   function startLive() {
     if (channel) return;
@@ -557,15 +625,20 @@
     loadSeq++; lastRangeKey = ""; joined = false; touched = new Set();
     clearTimeout(navT); clearTimeout(retryT); clearTimeout(firstT); retryMs = 5000;
     if (dlg.open) dlg.close();
-    state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = "";
+    if ($("teamDlg").open) $("teamDlg").close();
+    if ($("logDlg").open) $("logDlg").close();
+    state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = ""; state.me = null;
+    showMe();
     render();
   }
   function showLogin(msg) {
     document.body.classList.add("locked");
     clearData();
+    showSetup(false);
     $("loginErr").textContent = msg || "";
     $("loginPw").value = "";
-    setTimeout(() => $("loginPw").focus(), 50);
+    loadNames();
+    setTimeout(() => ($("loginName").value ? $("loginPw") : $("loginName")).focus(), 50);
   }
   async function lockOut(msg) {
     loginStamp.set(0);
@@ -574,50 +647,455 @@
     try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
     if (failed) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
   }
-  const teamUser = (s) => !!s && (s.user?.email || "").toLowerCase() === String(CFG.email).toLowerCase();
+  // Nur Kalender-Konten: der Team-Zugang und die persönlichen Zugänge (Adressen ohne Postfach unter kalender.wattcon-installation.de)
+  const kalUser = (s) => { const m = (s?.user?.email || "").toLowerCase(); return m === String(CFG.email).toLowerCase() || /^p-[0-9a-f]{12}@kalender\.wattcon-installation\.de$/.test(m); };
   async function enter() {
     document.body.classList.remove("locked");
+    showMe();
     startLive();
     // Die erste Ladung kommt mit dem Verbinden der Live-Verbindung; hängt diese, nach 3 s direkt laden.
     clearTimeout(firstT);
     firstT = setTimeout(() => { if (!joined && !isLocked()) refresh(); }, 3000);
   }
+
+  // ---------- Wer bin ich ----------
+  function showMe() {
+    const me = state.me;
+    $("me").textContent = !me || isLocked() ? "" : me.team ? "Team-Zugang" : (me.name || "");
+    $("teamBtn").hidden = !me || !me.admin || isLocked();
+  }
+  // Fragt die Datenbank, ob dieses Konto (noch) Zugang hat und wie die Person heißt. Ohne Verbindung bleibt alles, wie es ist.
+  // Antwort: "ok", "weg" (abgemeldet) oder "offen" (keine Antwort).
+  let meAt = 0, meSeq = 0, myEmail = "";
+  async function checkMe() {
+    const seq = ++meSeq;
+    let r;
+    try { r = await sb.rpc("kalender_ich"); } catch { return "offen"; }
+    if (isLocked()) return "weg";
+    if (seq !== meSeq) return "offen";
+    if (r.error) { if (loggedOut(r.error)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return "weg"; } return "offen"; }
+    if (!r.data) { accessGone(); return "weg"; }
+    meAt = Date.now(); state.me = r.data; showMe();
+    return "ok";
+  }
+  // Zugang entzogen (gesperrt, neuer Code, Team-Passwort abgeschaltet) oder neues Passwort auf einem anderen Gerät festgelegt
+  function accessGone() {
+    lockOut(myEmail === String(CFG.email).toLowerCase() ? "Das gemeinsame Team-Passwort wurde abgeschaltet. Bitte mit deinem Namen anmelden."
+      : state.me ? "Dein Zugang wurde geändert oder beendet. Bitte neu anmelden oder bei der Verwaltung melden."
+      : "Dieses Konto hat keinen Zugang zum Kalender.");
+  }
+
+  // ---------- Anmeldung mit Namen ----------
+  // Jede Person meldet sich mit ihrem Namen und eigenem Passwort an. Das erste Passwort legt sie mit einem Einmal-Code fest,
+  // den die Verwaltung im Kalender erzeugt (Server-Funktion kalender-zugang). Bis alle umgestellt sind, gibt es den Team-Zugang.
+  const FN = CFG.url ? CFG.url + "/functions/v1/kalender-zugang" : "";
+  // Ohne Antwort nach einiger Zeit aufgeben, statt endlos zu warten (schwaches Netz auf der Baustelle)
+  const within = (promise, ms) => new Promise((ok, no) => { const t = setTimeout(() => no(new Error("Zeit abgelaufen")), ms); promise.then(v => { clearTimeout(t); ok(v); }, e => { clearTimeout(t); no(e); }); });
+  function postFn(body, headers) {
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 20000);
+    return fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key, ...headers }, body: JSON.stringify(body), signal: ctl.signal })
+      .finally(() => clearTimeout(t));
+  }
+  let names = [], namesT = null, namesSeq = 0;
+  async function loadNames() {
+    clearTimeout(namesT);
+    if (!sb) return;
+    const seq = ++namesSeq;
+    let r;
+    try { r = await sb.rpc("kalender_namen"); } catch (e) { r = { error: e }; }
+    if (seq !== namesSeq || !isLocked()) return;
+    if (r.error || !Array.isArray(r.data)) {
+      if (!names.length) fillNames([], false);
+      $("loginErr").textContent = "Die Namensliste konnte nicht geladen werden. Prüfe die Internetverbindung.";
+      namesT = setTimeout(loadNames, 15000);
+      return;
+    }
+    if (/Namensliste/.test($("loginErr").textContent)) $("loginErr").textContent = "";
+    names = r.data;
+    fillNames(names, true);
+  }
+  const optVal = (n) => n.team ? "team" : n.id;
+  // Zur Auswahl stehen nur Personen mit eigenem Passwort und, solange es ihn gibt, der Team-Zugang
+  function fillNames(list, ok) {
+    const sel = $("loginName"), keep = sel.value || store.get("kal.loginName") || "";
+    sel.replaceChildren(...(list.length ? [el("option", { value: "" }, "Name wählen …"), ...list.map(n => el("option", { value: optVal(n) }, n.name))]
+      : [el("option", { value: "" }, ok ? "Noch niemand eingerichtet" : "Keine Namen geladen")]));
+    if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+    else if (list.length === 1) sel.value = optVal(list[0]);
+    syncUser();
+  }
+  // Für Passwort-Manager: der gewählte Name gilt als Benutzername
+  function syncUser() {
+    const o = $("loginName").selectedOptions[0];
+    $("loginUser").value = o && o.value ? o.textContent : "";
+  }
+  $("loginName").addEventListener("change", () => { syncUser(); $("loginErr").textContent = ""; });
+  addEventListener("online", () => { if (isLocked()) loadNames(); });
+
+  function showSetup(on) {
+    $("loginForm").hidden = on; $("setupForm").hidden = !on;
+    $("setupErr").textContent = ""; $("loginErr").textContent = "";
+    ["setupCode", "setupPw", "setupPw2"].forEach(id => { $(id).value = ""; });
+    if (on) setTimeout(() => $("setupCode").focus(), 30);
+  }
+  $("setupLink").addEventListener("click", () => showSetup(true));
+  $("backLink").addEventListener("click", () => { showSetup(false); loadNames(); $("loginPw").focus(); });
+
+  // Anmelden mit Adresse und Passwort, danach prüfen, ob das Konto in den Kalender darf
+  async function signIn(email, pw) {
+    let error = null, data = null;
+    try { ({ data, error } = await sb.auth.signInWithPassword({ email, password: pw })); } catch (e) { error = e; }
+    if (error) return error;
+    if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
+    myEmail = data.session.user.email.toLowerCase();
+    let me;
+    try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
+    if (!me.error && !me.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return null; }
+    state.me = me.error ? null : me.data;
+    meAt = me.error ? 0 : Date.now();
+    loginStamp.set(Date.now());
+    enter();
+    return null;
+  }
   $("loginForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (!sb) return;
-    const pw = $("loginPw").value;
-    if (!pw) { $("loginErr").textContent = "Bitte das Passwort eingeben."; return; }
+    const sel = $("loginName").value, pw = $("loginPw").value;
+    const who = names.find(n => optVal(n) === sel);
+    if (!who) { $("loginErr").textContent = "Bitte deinen Namen wählen."; $("loginName").focus(); return; }
+    if (!pw) { $("loginErr").textContent = "Bitte das Passwort eingeben."; $("loginPw").focus(); return; }
     $("loginBtn").disabled = true; $("loginErr").textContent = "";
-    let error = null, data = null;
-    try { ({ data, error } = await sb.auth.signInWithPassword({ email: CFG.email, password: pw })); } catch (e) { error = e; }
-    finally { $("loginBtn").disabled = false; }
-    if (!error && !teamUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return; }
+    let error;
+    try { error = await signIn(who.email, pw); } finally { $("loginBtn").disabled = false; }
     if (error) {
       const msg = error.status === 429 ? "Zu viele Versuche. Bitte ein paar Minuten warten."
+        : error.code === "user_banned" ? "Dieser Zugang ist gesperrt. Bitte bei der Verwaltung einen neuen Code holen."
         : /invalid/i.test(error.message || "") ? "Das Passwort stimmt nicht."
         : "Anmelden hat nicht geklappt. Prüfe die Internetverbindung.";
       $("loginErr").textContent = msg; $("loginPw").value = ""; $("loginPw").focus(); return;
     }
+    store.set("kal.loginName", sel);
     $("loginPw").value = "";
-    loginStamp.set(Date.now());
-    enter();
   });
+
+  // Erstes oder neues Passwort mit Einmal-Code festlegen. Wem der Code gehört, weiß nur der Server.
+  const SETUP_MSG = {
+    falsch: "Der Code stimmt nicht. Bitte genau abtippen, etwa K7MPX-2QXA9.",
+    abgelaufen: "Der Code ist abgelaufen. Bitte bei der Verwaltung einen neuen holen.",
+    kein_code: "Der Code gilt nicht mehr. Bitte bei der Verwaltung einen neuen holen.",
+    zu_viele: "Gerade wurden zu viele falsche Codes eingegeben. Bitte in einer Stunde erneut versuchen.",
+    passwort_kurz: "Das Passwort braucht mindestens 10 Zeichen.",
+    passwort_lang: "Das Passwort ist zu lang. Bitte ein kürzeres wählen.",
+    passwort_schwach: "Dieses Passwort ist zu leicht zu erraten. Bitte ein anderes wählen.",
+    passwort_wie_team: "Bitte nicht das bisherige Team-Passwort nehmen, sondern ein eigenes.",
+    eingabe: "Bitte den 10-stelligen Code prüfen.",
+  };
+  $("setupForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (!sb || !FN) return;
+    const code = $("setupCode").value.toUpperCase().replace(/[^0-9A-Z]/g, "");
+    const pw = $("setupPw").value, pw2 = $("setupPw2").value;
+    const err = code.length !== 10 ? "Der Code hat 10 Zeichen, etwa K7MPX-2QXA9."
+      : pw.length < 10 ? SETUP_MSG.passwort_kurz : pw !== pw2 ? "Die beiden Passwörter sind nicht gleich." : "";
+    if (err) { $("setupErr").textContent = err; return; }
+    $("setupBtn").disabled = true; $("setupErr").textContent = "";
+    let res = null, out = null;
+    try {
+      res = await postFn({ aktion: "einrichten", code, passwort: pw });
+      out = await res.json().catch(() => null);
+    } catch {}
+    if (!res || !res.ok || !out || !out.ok || !out.email) {
+      $("setupBtn").disabled = false;
+      $("setupErr").textContent = !res ? "Keine Verbindung. Prüfe das Internet und versuche es erneut."
+        : SETUP_MSG[out && out.fehler] || "Das hat nicht geklappt. Bitte später erneut versuchen.";
+      if (out && /^passwort/.test(out.fehler)) { $("setupPw").value = $("setupPw2").value = ""; $("setupPw").focus(); }
+      else if (out && /^(falsch|abgelaufen|kein_code|eingabe)$/.test(out.fehler)) $("setupCode").select();
+      return;
+    }
+    // Passwort steht: gleich damit anmelden
+    if (out.id) store.set("kal.loginName", String(out.id));
+    let error;
+    try { error = await signIn(out.email, pw); } finally { $("setupBtn").disabled = false; }
+    ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
+    if (error) { showSetup(false); loadNames(); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
+    toast("Dein Passwort ist gespeichert");
+  });
+
   // Abmelden betrifft nur dieses Gerät, die anderen bleiben angemeldet.
   $("logoutBtn").addEventListener("click", () => lockOut());
+
+  // ---------- Team und Zugänge (nur Verwaltung) ----------
+  const teamDlg = $("teamDlg");
+  async function teamCall(body) {
+    let s;
+    // Erneuern ohne Netz schlägt fehl oder dauert, ist aber kein Abmelden
+    try { s = await within(sb.auth.getSession(), 10000); } catch { throw { status: 0 }; }
+    if (s.error) throw { status: 0 };
+    const tok = s.data && s.data.session && s.data.session.access_token;
+    if (!tok) throw { status: 401 };
+    let res;
+    try {
+      res = await postFn(body, { Authorization: "Bearer " + tok });
+    } catch { throw { status: 0 }; }
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw { status: res.status, fehler: out && out.fehler };
+    return out;
+  }
+  const TEAM_MSG = {
+    keine_rechte: "Du darfst das Team nicht verwalten.",
+    selbst: "Das geht nicht für deinen eigenen Zugang.",
+    team_nicht: "Personen mit eigenem Passwort verwaltet nur eine Person mit Verwalter-Recht, nicht der Team-Zugang.",
+    name: "Bitte einen anderen Namen wählen: höchstens 40 Zeichen, nicht „Team…“, „Datenbank“ oder „System“.",
+    name_vergeben: "Diesen Namen gibt es schon.",
+    kein_verwalter: "Erst muss eine Person mit eigenem Passwort das Team verwalten dürfen.",
+    unbekannt: "Diese Person gibt es nicht mehr.",
+    server: "Der Server ist gerade gestört. Bitte gleich noch einmal versuchen.",
+  };
+  function teamFail(e) {
+    if (e && e.status === 401) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return; }
+    $("teamErr").textContent = TEAM_MSG[e && e.fehler] || "Das hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
+    if (e && e.fehler === "keine_rechte") checkMe();
+  }
+  const fmtWhen = (iso) => { const t = new Date(tsOf(iso)); return isNaN(t) ? "" : `${pad(t.getDate())}.${pad(t.getMonth() + 1)}.${t.getFullYear()}, ${pad(t.getHours())}:${pad(t.getMinutes())} Uhr`; };
+  // Zweistufig wie beim Löschen: erst „Wirklich?“, dann ausführen
+  function disarm(btn) {
+    if (!btn.classList.contains("armed")) return;
+    clearTimeout(btn._t); btn.classList.remove("armed"); btn.textContent = btn._was;
+  }
+  // Der zweite Tipp zählt erst nach einer halben Sekunde, damit ein versehentlicher Doppeltipp nicht gleich bestätigt
+  function confirmClick(btn, label, fn) {
+    if (!btn.classList.contains("armed")) {
+      btn._was = btn.textContent; btn._ab = performance.now();
+      btn.classList.add("armed"); btn.textContent = label;
+      btn._t = setTimeout(() => disarm(btn), 4000);
+      return;
+    }
+    if (performance.now() - btn._ab < 500) return;
+    disarm(btn); fn();
+  }
+  // teamGen zählt das Öffnen und Schließen mit: Antworten für ein schon geschlossenes Fenster werden verworfen
+  let teamBusy = false, teamGen = 0, offOk = false;
+  function hideCode() { $("codeVal").textContent = ""; $("codeFor").textContent = ""; $("codeUntil").textContent = ""; $("codeBox").hidden = true; }
+  async function teamAct(body, done) {
+    if (teamBusy) return;
+    const gen = teamGen;
+    teamBusy = true; $("teamErr").textContent = ""; hideCode();
+    teamDlg.querySelectorAll("button").forEach(b => { if (b.id !== "teamClose") b.disabled = true; });
+    try {
+      const r = await teamCall(body);
+      if (gen !== teamGen || !teamDlg.open || isLocked()) return;
+      if (done) done(r);
+      await loadTeam();
+    }
+    catch (e) { if (gen === teamGen) teamFail(e); }
+    finally {
+      teamBusy = false;
+      teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; });
+      $("teamOffBtn").disabled = !offOk;
+    }
+  }
+  function showCode(name, code, bis) {
+    $("codeFor").textContent = `Einmal-Code für ${name}`;
+    $("codeVal").textContent = code.slice(0, 5) + "-" + code.slice(5);
+    $("codeUntil").textContent = `Gültig bis ${fmtWhen(bis)}, nur einmal. Persönlich weitergeben.`;
+    $("codeBox").hidden = false;
+  }
+  const STATUS = {
+    aktiv: () => "Eigenes Passwort aktiv",
+    code: (p) => `Code offen bis ${fmtWhen(p.code_bis)}` + (p.team_code ? " (aus der Team-Phase)" : ""),
+    abgelaufen: (p) => `Code abgelaufen am ${fmtWhen(p.code_bis)}`,
+    neu: () => "Noch kein Code",
+    gesperrt: () => "Gesperrt",
+  };
+  // Umbenennen direkt in der Zeile, z. B. wenn „User 1“ an eine neue Person geht
+  function renameRow(li, p) {
+    const inp = el("input", { type: "text", maxlength: "40", value: p.name, autocomplete: "off", "aria-label": `Neuer Name für ${p.name}` });
+    li.replaceChildren(el("form", { class: "ren", novalidate: true, onsubmit: (ev) => {
+      ev.preventDefault();
+      const name = inp.value.replace(/\s+/g, " ").trim();
+      if (!name) { $("teamErr").textContent = "Bitte einen Namen eingeben."; inp.focus(); return; }
+      if (name === p.name) { drawTeam(); return; }
+      teamAct({ aktion: "umbenennen", person: p.id, name }, () => toast(`${p.name} heißt jetzt ${name}`));
+    } }, inp,
+      el("span", { class: "pa" }, el("button", { class: "btn primary", type: "submit" }, "Speichern"), el("button", { class: "btn", type: "button", onclick: () => drawTeam() }, "Abbrechen")),
+      p.eingerichtet ? el("span", { class: "ps note" }, "Bekommt jemand anderes diesen Zugang, danach „Neuer Code“ drücken. Dann gilt das alte Passwort nicht mehr.") : null));
+    inp.focus(); inp.select();
+  }
+  let teamData = null;
+  function drawTeam() {
+    const d = teamData;
+    if (!d) return;
+    const ich = d.ich;
+    $("people").replaceChildren(...(d.personen.length ? d.personen.map(p => {
+      const self = !!ich && p.email === ich, st = (STATUS[p.status] || STATUS.gesperrt)(p);
+      // Der Team-Zugang richtet nur ein: Personen mit eigenem Passwort ändert nur, wer selbst verwalten darf.
+      // Ausnahme: das Verwalter-Recht geben (falls sich der Inhaber ohne Häkchen eingerichtet hat); danach verwaltet das Team nie wieder.
+      const locked = d.team && p.eingerichtet;
+      const promote = locked && !p.admin && p.status === "aktiv";
+      const li = el("li", null,
+        el("span", { class: "pn" }, p.name + (p.admin ? " · verwaltet" : "") + (self ? " (du)" : "")),
+        el("span", { class: "ps", "data-s": p.status }, st));
+      const ren = el("button", { class: "btn", type: "button", onclick: () => renameRow(li, p) }, "Umbenennen");
+      li.append(self ? el("span", { class: "pa" }, ren) : promote ? el("span", { class: "pa" },
+        el("button", { class: "btn", type: "button", onclick: (ev) => confirmClick(ev.currentTarget, `Ja, ich bin ${p.name.length > 16 ? p.name.slice(0, 15) + "…" : p.name}`, () =>
+          teamAct({ aktion: "admin_setzen", person: p.id, admin: true }, () => {
+            teamDlg.close(); checkMe();
+            toast(`${p.name} verwaltet jetzt. Zum Verwalten mit dem eigenen Namen anmelden.`);
+          })) }, "Verwalten an"))
+        : locked ? el("span", { class: "pa note" }, "Ändern nur mit eigenem Verwalter-Zugang") : el("span", { class: "pa" },
+        el("button", { class: "btn", type: "button", onclick: (ev) => {
+          const go = () => teamAct({ aktion: "neuer_code", person: p.id }, (r) => showCode(p.name, r.code, r.bis));
+          if (p.status === "aktiv") confirmClick(ev.currentTarget, "Altes Passwort sperren?", go); else go();
+        } }, p.status === "neu" ? "Code erzeugen" : "Neuer Code"),
+        p.status === "gesperrt" || p.status === "neu" ? null : el("button", { class: "btn", type: "button",
+          onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich sperren?", () => teamAct({ aktion: "sperren", person: p.id }, () => toast(`${p.name} ist gesperrt`))) }, "Sperren"),
+        el("button", { class: "btn", type: "button", onclick: () => teamAct({ aktion: "admin_setzen", person: p.id, admin: !p.admin }) }, p.admin ? "Verwalten aus" : "Verwalten an"),
+        ren,
+        el("button", { class: "btn danger", type: "button",
+          onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich entfernen?", () => teamAct({ aktion: "entfernen", person: p.id }, () => toast(`${p.name} ist entfernt, die Termine bleiben`))) }, "Entfernen")));
+      return li;
+    }) : [el("li", { class: "empty" }, "Noch niemand angelegt. Lege zuerst dich selbst an und erlaube dir das Verwalten.")]));
+    // Mit dem Team-Passwort: Schritt für Schritt zum eigenen Verwalter-Zugang
+    $("teamStart").hidden = !d.team;
+    $("adminTip").hidden = !ich;
+    $("logBtn").hidden = !ich;
+    offOk = !!ich && !!d.team_aktiv;
+    $("teamOff").hidden = !d.team_aktiv;
+    $("teamOffBtn").disabled = !offOk;
+    const alt = d.personen.filter(p => p.team_code).map(p => p.name);
+    $("teamOffHint").textContent = !ich ? "Das gemeinsame Team-Passwort funktioniert noch. Abschalten kann es nur, wer mit dem eigenen Namen angemeldet ist und verwalten darf."
+      : "Das gemeinsame Team-Passwort funktioniert noch. Schalte es ab, sobald du nicht mehr darauf angewiesen bist. Wer es kennt, kommt danach nicht mehr hinein."
+        + (alt.length ? ` Die offenen Codes aus der Team-Phase (${alt.join(", ")}) werden dabei ungültig; erzeuge danach neue.` : "");
+  }
+  async function loadTeam() {
+    const gen = teamGen;
+    let d;
+    try { d = await teamCall({ aktion: "liste" }); } catch (e) { if (gen === teamGen) teamFail(e); return; }
+    if (gen !== teamGen || !teamDlg.open || isLocked()) return;
+    teamData = d;
+    drawTeam();
+  }
+  $("teamBtn").addEventListener("click", () => {
+    $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
+    $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null;
+    disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
+    teamDlg.showModal(); loadTeam();
+  });
+  $("teamClose").addEventListener("click", () => teamDlg.close());
+  // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
+  teamDlg.addEventListener("close", () => {
+    teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn")); teamData = null;
+    if (logDlg.open) logDlg.close();
+  });
+
+  // ---------- Änderungsprotokoll (nur Verwalter mit eigenem Zugang) ----------
+  const logDlg = $("logDlg");
+  const FELD = { title: "Titel", date: "Datum", all_day: "Ganztägig", start_time: "Beginn", end_time: "Ende", person: "Eingetragen von", note: "Notiz", cat: "Art" };
+  const dmy = (s) => /^\d{4}-\d\d-\d\d$/.test(s || "") ? `${s.slice(8, 10)}.${s.slice(5, 7)}.${s.slice(0, 4)}` : (s || "");
+  const wert = (k, v) => v == null || v === "" ? "–" : k === "date" ? dmy(v) : k === "all_day" ? (v ? "ja" : "nein") : k === "cat" ? catLabel(v) : String(v);
+  // Ein Eintrag als Text: Zeit, wer, was. Bei Änderungen die Felder vorher → nachher, beim Anlegen und Löschen der ganze Termin
+  // (damit sich ein gelöschter Termin mit Uhrzeit und Notiz wieder eintragen lässt)
+  function logText(x) {
+    if (x.art !== "termin") return { was: "Zugang" + (x.person ? ` ${x.person}` : "") + `: ${x.aktion}`, details: [] };
+    const t = x.nachher || x.vorher || {};
+    const was = `Termin „${t.title || "–"}“ am ${dmy(t.date)} ${x.aktion}`;
+    if (x.aktion === "geändert") {
+      return { was, details: Object.keys(FELD).filter(k => JSON.stringify(x.vorher?.[k] ?? null) !== JSON.stringify(x.nachher?.[k] ?? null))
+        .map(k => `${FELD[k]}: ${wert(k, x.vorher?.[k])} → ${wert(k, x.nachher?.[k])}`) };
+    }
+    const zeit = t.all_day ? "ganztägig" : `${t.start_time || "–"} bis ${t.end_time || "–"} Uhr`;
+    return { was, details: [`Zeit: ${zeit}`, `${FELD.cat}: ${wert("cat", t.cat)}`, `${FELD.person}: ${wert("person", t.person)}`]
+      .concat(t.note ? [`${FELD.note}: ${t.note}`] : []) };
+  }
+  let logGen = 0, logLast = null, logBusy = false;
+  async function logPage(vor, anzahl) {
+    let r;
+    try { r = await within(sb.rpc("kalender_protokoll", { p_vor_am: vor ? vor.am : null, p_vor_k: vor ? vor.k : null, p_anzahl: anzahl }), 20000); }
+    catch { throw { status: 0 }; }
+    if (r.error) throw loggedOut(r.error) ? { status: 401 } : { status: 0 };
+    if (!Array.isArray(r.data)) throw { status: 403 };
+    return r.data;
+  }
+  function logFail(e) {
+    if (e && e.status === 401) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return; }
+    $("logErr").textContent = e && e.status === 403 ? "Das Protokoll sehen nur Verwalter mit eigenem Zugang." : "Das Protokoll konnte nicht geladen werden. Prüfe die Verbindung.";
+  }
+  async function loadLog(more) {
+    if (logBusy) return;
+    const gen = logGen;
+    logBusy = true; $("logErr").textContent = ""; $("logMore").disabled = true;
+    try {
+      const rows = await logPage(more ? logLast : null, 100);
+      if (gen !== logGen || !logDlg.open) return;
+      if (!more) $("logList").replaceChildren();
+      for (const x of rows) {
+        const { was, details } = logText(x);
+        $("logList").append(el("li", null, el("span", { class: "lt num" }, fmtStamp(x.am)), el("span", { class: "lw" }, x.wer),
+          el("span", { class: "la" }, was), ...details.map(d => el("span", { class: "ld" }, d))));
+      }
+      if (!more && !rows.length) $("logList").append(el("li", { class: "empty" }, "Noch keine Einträge."));
+      logLast = rows.length ? rows[rows.length - 1] : logLast;
+      $("logMore").hidden = rows.length < 100;
+    } catch (e) { if (gen === logGen) logFail(e); }
+    finally { logBusy = false; $("logMore").disabled = false; }
+  }
+  // Als Tabelle (CSV, öffnet in Excel): alle Einträge, neueste zuerst
+  const zelle = (v) => { let s = String(v ?? ""); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  async function saveLog() {
+    if (logBusy) return;
+    const gen = logGen;
+    logBusy = true; $("logCsv").disabled = true; $("logErr").textContent = "";
+    try {
+      const all = [];
+      for (let vor = null; ;) {
+        const rows = await logPage(vor, 500);
+        if (gen !== logGen || !logDlg.open) return;
+        all.push(...rows);
+        if (rows.length < 500) break;
+        vor = rows[rows.length - 1];
+      }
+      const lines = [["Zeit", "Wer", "Was", "Änderungen"].map(zelle).join(";")];
+      for (const x of all) { const { was, details } = logText(x); lines.push([fmtWhen(x.am), x.wer, was, details.join(" | ")].map(zelle).join(";")); }
+      const now = new Date();
+      const url = URL.createObjectURL(new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" }));
+      const a = el("a", { href: url, download: `Teamkalender_Protokoll_${ymd(now)}.csv` });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast("Protokoll wird gespeichert. Vertraulich, enthält Kundendaten.");
+    } catch (e) { if (gen === logGen) logFail(e); }
+    finally { logBusy = false; $("logCsv").disabled = false; }
+  }
+  $("logBtn").addEventListener("click", () => {
+    logGen++; logLast = null; $("logList").replaceChildren(); $("logErr").textContent = ""; $("logMore").hidden = true;
+    logDlg.showModal(); loadLog(false);
+  });
+  $("logMore").addEventListener("click", () => loadLog(true));
+  $("logCsv").addEventListener("click", saveLog);
+  $("logClose").addEventListener("click", () => logDlg.close());
+  // Kundendaten nur so lange auf dem Bildschirm, wie das Fenster offen ist
+  logDlg.addEventListener("close", () => { logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; });
+  $("addForm").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const name = $("addName").value.replace(/\s+/g, " ").trim(), admin = $("addAdmin").checked;
+    if (!name) { $("teamErr").textContent = "Bitte einen Namen eingeben."; $("addName").focus(); return; }
+    teamAct({ aktion: "anlegen", name, admin }, (r) => { showCode(name, r.code, r.bis); $("addForm").reset(); });
+  });
+  $("teamOffBtn").addEventListener("click", (ev) => confirmClick(ev.currentTarget, "Wirklich abschalten?",
+    () => teamAct({ aktion: "team_aus" }, () => toast("Das Team-Passwort ist abgeschaltet"))));
 
   (async () => {
     if (!sb) {
       setStatus("readonly", "Offline");
       $("loginErr").textContent = "Der Kalender konnte nicht geladen werden. Prüfe die Internetverbindung und lade die Seite neu.";
-      $("loginBtn").disabled = true;
+      $("loginBtn").disabled = true; $("setupLink").hidden = true;
       return;
     }
     // Rückruf bleibt synchron: ein await auf sb.auth hier würde die Anmeldung blockieren.
     sb.auth.onAuthStateChange((event) => { if (event === "SIGNED_OUT" && !document.body.classList.contains("locked")) showLogin("Bitte erneut anmelden."); });
     const { data } = await sb.auth.getSession();
     const stamp = loginStamp.get();
-    if (data.session && !teamUser(data.session)) lockOut();
-    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) enter();
+    if (data.session && !kalUser(data.session)) lockOut();
+    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) { myEmail = data.session.user.email.toLowerCase(); enter(); checkMe(); }
     else if (data.session) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
     else showLogin();
   })();

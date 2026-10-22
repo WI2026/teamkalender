@@ -18,6 +18,7 @@
 <link rel="stylesheet" href="style.css">
 <script src="vendor/supabase.js" defer></script>
 <script src="config.js" defer></script>
+<script src="pdf.js" defer></script>
 <script src="app.js" defer></script>
 <script src="bg-szene.js" defer></script>
 <script src="bg.js" defer></script>
@@ -31,12 +32,32 @@
       <span class="claim">Plan &amp; Handwerk aus einer Hand</span>
     </div>
     <h1><span class="sr">PentaWerk </span>Teamkalender</h1>
-    <p>Bitte das Team-Passwort eingeben.</p>
+    <p>Wähle deinen Namen und gib dein Passwort ein.</p>
+    <label class="sr" for="loginName">Name</label>
+    <select id="loginName" class="login-select"><option value="">Namen werden geladen …</option></select>
+    <input type="text" id="loginUser" class="sr" autocomplete="username" tabindex="-1" aria-hidden="true" readonly>
     <label class="sr" for="loginPw">Passwort</label>
     <input type="password" id="loginPw" autocomplete="current-password" placeholder="Passwort">
     <div class="err" id="loginErr" role="alert"></div>
     <button class="btn primary" id="loginBtn" type="submit">Öffnen</button>
+    <button class="linkbtn" id="setupLink" type="button">Zum ersten Mal hier oder Passwort vergessen?</button>
     <p class="login-foot">PentaWerk ist eine Marke der Wattcon Installation UG</p>
+  </form>
+  <form class="login-card" id="setupForm" novalidate hidden>
+    <img class="mark" src="mark.svg" alt="" width="48" height="47">
+    <h1>Eigenes Passwort festlegen</h1>
+    <p>Den Einmal-Code bekommst du persönlich von der Kalender-Verwaltung. Er gilt 7 Tage und nur einmal.</p>
+    <label class="sr" for="setupCode">Einmal-Code</label>
+    <input type="text" id="setupCode" placeholder="Einmal-Code, z. B. K7MPX-2QXA9" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="16">
+    <label class="sr" for="setupPw">Neues Passwort</label>
+    <input type="password" id="setupPw" autocomplete="new-password" placeholder="Neues Passwort">
+    <label class="sr" for="setupPw2">Passwort wiederholen</label>
+    <input type="password" id="setupPw2" autocomplete="new-password" placeholder="Passwort wiederholen">
+    <p class="hint">Mindestens 10 Zeichen, am besten ein eigener kurzer Satz. Nicht das bisherige Team-Passwort.</p>
+    <div class="err" id="setupErr" role="alert"></div>
+    <button class="btn primary" id="setupBtn" type="submit">Passwort festlegen</button>
+    <button class="linkbtn" id="backLink" type="button">Zurück zur Anmeldung</button>
+    <p class="login-foot">Code abgelaufen oder schon benutzt? Dann bei der Verwaltung einen neuen holen.</p>
   </form>
 </div>
 
@@ -53,7 +74,13 @@
       </div>
     </div>
     <div class="spacer"></div>
+    <span class="me" id="me"></span>
+    <button class="btn ghost" id="teamBtn" type="button" hidden>Team</button>
     <button class="btn ghost logout" id="logoutBtn" type="button">Abmelden</button>
+    <button class="btn ghost" id="pdfBtn" type="button" title="Termine ab diesem Monat als PDF speichern, zum Nachsehen ohne Internet">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7 8 10.2 11.2 7M3 13.5h10"/></svg>
+      PDF
+    </button>
     <button class="btn primary" id="newBtn" type="button">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
       Neuer Termin
@@ -135,6 +162,58 @@
       <button class="btn primary" type="submit" id="saveBtn">Speichern</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="teamDlg" aria-labelledby="teamTitle">
+  <div class="team">
+    <h4 id="teamTitle">Team und Zugänge</h4>
+    <p class="hint">Jede Person bekommt einen Einmal-Code und legt damit ihr eigenes Passwort fest. Gib den Code nur der Person selbst, persönlich oder als Direktnachricht. Er gilt einmal und 7 Tage.</p>
+    <ol class="hint steps" id="teamStart" hidden>
+      <li>Bei deinem Namen „Verwalten an“ tippen. Fehlt dein Name, lege dich unten an und setze dabei das Häkchen „darf das Team verwalten“.</li>
+      <li>„Code erzeugen“ tippen und den Code notieren.</li>
+      <li>Abmelden, „Zum ersten Mal hier?“ wählen und mit dem Code dein eigenes Passwort festlegen.</li>
+      <li>Danach erzeugst du die Codes für alle anderen und schaltest das Team-Passwort ab.</li>
+    </ol>
+    <ul class="people" id="people"></ul>
+    <form class="addp" id="addForm" novalidate>
+      <div class="field">
+        <label for="addName">Neue Person</label>
+        <input type="text" id="addName" maxlength="40" placeholder="Vorname oder Name" autocomplete="off">
+      </div>
+      <label class="toggle" for="addAdmin"><input type="checkbox" id="addAdmin"> darf das Team verwalten</label>
+      <button class="btn primary" id="addBtn" type="submit">Anlegen und Code erzeugen</button>
+    </form>
+    <div class="codebox" id="codeBox" hidden role="status">
+      <span id="codeFor"></span>
+      <strong class="code num" id="codeVal"></strong>
+      <span id="codeUntil"></span>
+    </div>
+    <div class="logrow" id="adminTip" hidden>
+      <p class="hint">Das Änderungsprotokoll sehen nur Personen mit Verwalter-Recht. Wer wann was geändert hat, steht dort zwölf Monate lang.</p>
+      <button class="btn" id="logBtn" type="button" hidden>Änderungsprotokoll</button>
+    </div>
+    <div class="teamoff" id="teamOff" hidden>
+      <p class="hint" id="teamOffHint">Das gemeinsame Team-Passwort funktioniert noch. Wenn alle ihr eigenes haben, schalte es ab. Wer es kennt, kommt danach nicht mehr hinein.</p>
+      <button class="btn danger" id="teamOffBtn" type="button">Team-Passwort abschalten</button>
+    </div>
+    <div class="err" id="teamErr" role="alert"></div>
+    <div class="actions"><span class="spacer"></span><button class="btn ghost" id="teamClose" type="button">Schließen</button></div>
+  </div>
+</dialog>
+
+<dialog id="logDlg" aria-labelledby="logTitle">
+  <div class="team">
+    <h4 id="logTitle">Änderungsprotokoll</h4>
+    <p class="hint">Wer hat wann was geändert, neueste zuerst. Vertraulich: enthält Kundendaten.</p>
+    <ul class="log" id="logList"></ul>
+    <div class="err" id="logErr" role="alert"></div>
+    <div class="actions">
+      <button class="btn" id="logMore" type="button" hidden>Ältere laden</button>
+      <button class="btn" id="logCsv" type="button">Als Tabelle speichern</button>
+      <span class="spacer"></span>
+      <button class="btn ghost" id="logClose" type="button">Schließen</button>
+    </div>
+  </div>
 </dialog>
 
 <div class="toast" id="toast" hidden role="status"></div>
