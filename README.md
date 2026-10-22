@@ -5,7 +5,7 @@ Gemeinsamer, passwortgeschützter Terminkalender. Statische Seite auf GitHub Pag
 ## Dateien
 - `index.html`, `style.css`, `app.js` – die App
 - `pdf.js` – erzeugt im Browser das PDF „Termine ab diesem Monat“ zum Nachsehen ohne Internet (nichts verlässt das Gerät)
-- `supabase/migrations/` – Datenbank-Änderungen (persönliche Zugänge), `supabase/functions/kalender-zugang/` – Server-Funktion für Einmal-Codes und Verwaltung, `supabase/config.toml` – Einstellungen dazu
+- `supabase/migrations/` – Datenbank-Änderungen (persönliche Zugänge, Projektfortschritt), `supabase/functions/kalender-zugang/` – Server-Funktion für Einmal-Codes und Verwaltung, `supabase/config.toml` – Einstellungen dazu
 - `bg-szene.js` – Hintergrund „Wallbox am Abend“: ein echtes Foto, in dem sich nur wenig ruhig bewegt (Wolken ziehen, Sterne funkeln, der Ring der Wallbox leuchtet wie beim Laden, die nasse Einfahrt schimmert). Ein kleiner WebGL-Shader, ohne WebGL steht das Foto still.
 - `bg/` – Foto im Quer- und Hochformat (Handy) mit je einer Maske, welche Stellen sich bewegen
 - `bg.js` – Rahmen für den Hintergrund: Bildrate, Pause im Hintergrund-Tab, „Bewegung reduzieren“, Dunkelmodus; scheitert die Szene, bleibt der Farbverlauf stehen
@@ -21,8 +21,16 @@ Gemeinsamer, passwortgeschützter Terminkalender. Statische Seite auf GitHub Pag
 - Start: mit dem gemeinsamen Team-Passwort anmelden, unter „Team“ beim eigenen Namen „Verwalten an“ und „Code erzeugen“ (fehlt der Name: unten anlegen, mit Häkchen „darf das Team verwalten“), dann mit dem Code das eigene Passwort festlegen. Ist das Häkchen vergessen worden, gibt das Team-Passwort dem eigenen Namen einmal „Verwalten an“. Ab da verwaltet das Team-Passwort nie wieder, auch nicht, wenn der Verwalter später einen neuen Code braucht. Codes, die das Team-Passwort für weitere Verwalter erzeugt hat, gelten dann nicht mehr.
 - Danach die Codes für alle anderen erzeugen und das Team-Passwort unter „Team“ abschalten. Offene Codes, die noch mit dem Team-Passwort erzeugt wurden, werden dabei ungültig.
 
+## Projekte
+- Oben gibt es zwei Reiter: „Kalender“ und „Projekte“. Unter „Projekte“ steht die Übersicht: laufende (auch pausierte) und fertige (auch stornierte) Projekte, Suche nach Kunde, Auftragsnummer, Art oder Notiz. Je Projekt: der nächste offene Schritt und seit wann er ansteht (ab 14 Tagen hervorgehoben), der nächste Termin und der Fortschritt. Der älteste Auftrag steht oben.
+- Projekte gibt es nur für unterschriebene Aufträge: Beim Anlegen muss bestätigt werden, dass die Unterschrift vorliegt, und das Datum der Unterschrift wird gespeichert (nicht in der Zukunft).
+- Jede Art (PV-Anlage, Speicher, Wallbox, Wärmepumpe, Zählerschrank, Elektroinstallation, Sonstiges) bringt eine Checkliste mit. Beim Anlegen lassen sich Schritte abwählen (Speicher und Wallbox bei PV sind zunächst abgewählt), später unter „Schritte bearbeiten“ ergänzen oder streichen. Neue Schritte kommen vor „Schlussrechnung gestellt“ und „Bezahlt“. Höchstens 40 Schritte je Projekt.
+- Im Termin gibt es das Feld „Projekt“ (nur laufende Projekte, „+“ legt direkt ein neues an). Unter einem Termin mit Projekt steht eine Zeile mit dem Stand; ein Tipp darauf öffnet das Unterfenster mit der Checkliste (auf dem Handy als Blatt von unten). Häkchen werden sofort gespeichert, wer und wann trägt die Datenbank selbst ein. Einen erledigten Schritt wieder öffnen braucht einen zweiten Tipp.
+- Gespeichert werden nur Text und Häkchen, keine Dateien oder Fotos, damit der Speicher der kostenlosen Stufe reicht. Die Seite lädt alle Projekte (nur Kopfdaten) und die Schritte der nicht fertigen Projekte; beim Wiederverbinden fragt sie zuerst einen kleinen Stand ab und lädt nur neu, wenn sich etwas geändert hat.
+- Rechte: Lesen, Anlegen, Ändern und Abhaken dürfen alle mit Kalender-Zugang. Projekte löschen und erledigte Schritte streichen dürfen nur Personen mit Verwalter-Recht und eigenem Passwort (die Datenbank prüft das, nicht nur die Seite). Wird ein Projekt gelöscht, bleiben seine Termine, nur ohne Projekt.
+
 ## Änderungsprotokoll
-- Jede Änderung an Terminen (angelegt, geändert, gelöscht) speichert die Datenbank mit Zeit, angemeldeter Person und den Werten vorher und nachher, dazu alle Änderungen an Zugängen. Bei gelöschten Terminen zeigt das Protokoll den ganzen Termin mit Zeit und Notiz, damit man ihn wieder eintragen kann. Das Feld „Eingetragen von“ kann man frei ausfüllen, das Protokoll nennt immer die wirklich angemeldete Person.
+- Jede Änderung an Terminen und Projekten (angelegt, geändert, abgehakt, gelöscht) speichert die Datenbank mit Zeit, angemeldeter Person und den Werten vorher und nachher, dazu alle Änderungen an Zugängen. Bei gelöschten Terminen zeigt das Protokoll den ganzen Termin mit Zeit und Notiz, damit man ihn wieder eintragen kann. Das Feld „Eingetragen von“ kann man frei ausfüllen, das Protokoll nennt immer die wirklich angemeldete Person.
 - Lesen können es nur Personen mit Verwalter-Recht und eigenem Passwort (unter „Team“ → „Änderungsprotokoll“), auch als Tabelle (CSV für Excel). Das Team-Konto und alle anderen sehen es nicht.
 - Einträge älter als zwölf Monate löscht die Datenbank selbst. Das Protokoll enthält Kundendaten; die Tabelle nach Gebrauch löschen.
 

@@ -15,13 +15,13 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="manifest" href="manifest.webmanifest">
-<link rel="stylesheet" href="style.css">
-<script src="vendor/supabase.js" defer></script>
-<script src="config.js" defer></script>
-<script src="pdf.js" defer></script>
-<script src="app.js" defer></script>
-<script src="bg-szene.js" defer></script>
-<script src="bg.js" defer></script>
+<link rel="stylesheet" href="style.css?v=20261023">
+<script src="vendor/supabase.js?v=20261023" defer></script>
+<script src="config.js?v=20261023" defer></script>
+<script src="pdf.js?v=20261023" defer></script>
+<script src="app.js?v=20261023" defer></script>
+<script src="bg-szene.js?v=20261023" defer></script>
+<script src="bg.js?v=20261023" defer></script>
 </head>
 <body class="locked">
 <div class="login" id="login">
@@ -73,7 +73,11 @@
         </div>
       </div>
     </div>
-    <div class="spacer"></div>
+    <div class="seg tabs" role="tablist" aria-label="Bereich">
+      <button type="button" role="tab" id="tab-kalender" data-tab="kalender" aria-selected="true" aria-controls="calView">Kalender</button>
+      <button type="button" role="tab" id="tab-projekte" data-tab="projekte" aria-selected="false" aria-controls="projView" tabindex="-1">Projekte</button>
+    </div>
+    <div class="acts">
     <span class="me" id="me"></span>
     <button class="btn ghost" id="teamBtn" type="button" hidden>Team</button>
     <button class="btn ghost logout" id="logoutBtn" type="button">Abmelden</button>
@@ -83,8 +87,9 @@
     </button>
     <button class="btn primary" id="newBtn" type="button">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>
-      Neuer Termin
+      <span id="newLbl">Neuer Termin</span>
     </button>
+    </div>
   </div>
 
   <div class="banner" id="banner" hidden>
@@ -92,6 +97,7 @@
     <span id="bannerText"></span>
   </div>
 
+  <div class="calview" id="calView" role="tabpanel" aria-labelledby="tab-kalender">
   <div class="toolbar">
     <div class="period">
       <h2 id="periodTitle">Oktober 2026</h2>
@@ -113,6 +119,26 @@
     <div class="board" id="board"></div>
     <aside class="agenda" id="agenda" aria-live="polite"></aside>
   </div>
+  </div>
+
+  <section class="projview" id="projView" role="tabpanel" aria-labelledby="tab-projekte" hidden>
+    <div class="ptools">
+      <div class="period">
+        <h2>Projekte</h2>
+        <span class="kw" id="projCount"></span>
+      </div>
+      <div class="psearch">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+        <input type="search" id="projSearch" placeholder="Suchen" aria-label="Projekte durchsuchen: Kunde, Nummer, Art oder Notiz" autocomplete="off" maxlength="60" enterkeyhint="search">
+      </div>
+      <div class="seg" role="group" aria-label="Stand" id="statusSeg">
+        <button type="button" data-status="laufend" aria-pressed="true">Laufend</button>
+        <button type="button" data-status="fertig" aria-pressed="false">Fertig</button>
+      </div>
+    </div>
+    <div class="plist" id="projList" aria-live="polite"></div>
+    <p class="phint">Nur unterschriebene Aufträge. Gespeichert werden nur Text und Häkchen, keine Dateien oder Fotos.</p>
+  </section>
 </div>
 
 <dialog id="dlg" aria-labelledby="dlgTitle">
@@ -121,6 +147,15 @@
     <div class="field">
       <label for="f-title">Titel</label>
       <input type="text" id="f-title" maxlength="120" placeholder="z. B. Zählerschrank Musterstraße 4" autocomplete="off">
+    </div>
+    <div class="field" id="projField">
+      <label for="f-projekt">Projekt <span class="opt">(optional)</span></label>
+      <div class="projpick">
+        <select id="f-projekt"><option value="">Kein Projekt</option></select>
+        <button class="btn" type="button" id="projNewBtn" aria-label="Neues Projekt anlegen">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>Projekt</button>
+      </div>
+      <button class="progrow" type="button" id="progRow" hidden></button>
     </div>
     <div class="field">
       <span class="lbl" id="catLbl">Art</span>
@@ -216,7 +251,62 @@
   </div>
 </dialog>
 
-<div class="toast" id="toast" hidden role="status"></div>
+<dialog id="progDlg" class="sheet" aria-labelledby="progTitle">
+  <div class="prog" id="progBody"></div>
+</dialog>
+
+<dialog id="projDlg" aria-labelledby="projDlgTitle">
+  <form id="projForm" method="dialog" novalidate>
+    <h4 id="projDlgTitle">Neues Projekt</h4>
+    <div class="field">
+      <label for="p-titel">Kunde und Projekt</label>
+      <input type="text" id="p-titel" maxlength="80" placeholder="z. B. Müller, Hauptstraße 4, Ort" autocomplete="off">
+    </div>
+    <div class="field">
+      <span class="lbl" id="artLbl">Art</span>
+      <div class="cats arten" role="radiogroup" aria-labelledby="artLbl" id="arten"></div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="p-datum">Auftrag unterschrieben am</label>
+        <input type="date" id="p-datum">
+      </div>
+      <div class="field">
+        <label for="p-nr">Auftragsnummer <span class="opt">(optional)</span></label>
+        <input type="text" id="p-nr" maxlength="30" autocomplete="off">
+      </div>
+    </div>
+    <div class="field">
+      <label for="p-wer">Verantwortlich <span class="opt">(optional)</span></label>
+      <input type="text" id="p-wer" maxlength="60" autocomplete="off" placeholder="Name" list="p-werListe">
+      <datalist id="p-werListe"></datalist>
+    </div>
+    <div class="field">
+      <label for="p-notiz">Notiz <span class="opt">(optional)</span></label>
+      <textarea id="p-notiz" maxlength="1000" placeholder="Adresse, Ansprechpartner, Besonderheiten …"></textarea>
+    </div>
+    <div class="field" id="p-statusFeld" hidden>
+      <span class="lbl" id="pStatusLbl">Stand</span>
+      <div class="cats" role="radiogroup" aria-labelledby="pStatusLbl" id="p-status"></div>
+    </div>
+    <details class="vorlage" id="p-vorlage">
+      <summary><span id="p-vorlageSum">Checkliste</span><span class="mehr">anpassen</span></summary>
+      <ul class="vliste" id="p-vorlageListe"></ul>
+      <p class="hint">Weitere Schritte lassen sich später im Projekt ergänzen.</p>
+    </details>
+    <label class="toggle sign" for="p-sign" id="p-signRow"><input type="checkbox" id="p-sign"> Der Auftrag liegt vom Kunden unterschrieben vor</label>
+    <div class="err" id="projErr" role="alert"></div>
+    <div class="actions">
+      <button class="btn danger" type="button" id="projDel" hidden>Projekt löschen</button>
+      <span class="stamp" id="projStamp"></span>
+      <span class="spacer"></span>
+      <button class="btn ghost" type="button" id="projCancel">Abbrechen</button>
+      <button class="btn primary" type="submit" id="projSave">Anlegen</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden role="status" popover="manual"></div>
 
 <canvas id="bgfx" aria-hidden="true"></canvas>
 <canvas id="bg3d" aria-hidden="true"></canvas>
