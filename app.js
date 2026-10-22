@@ -344,14 +344,15 @@
   dlg.addEventListener("close", () => { $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null; });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
-  let delTimer = null;
+  let delTimer = null, delAb = 0;
   function disarmDelete() { clearTimeout(delTimer); const b = $("delBtn"); b.classList.remove("armed"); b.textContent = "Löschen"; }
   $("delBtn").addEventListener("click", async () => {
     const b = $("delBtn");
     if (!b.classList.contains("armed")) {
-      b.classList.add("armed"); b.textContent = "Wirklich löschen?";
+      b.classList.add("armed"); b.textContent = "Wirklich löschen?"; delAb = performance.now();
       delTimer = setTimeout(disarmDelete, 4000); return;
     }
+    if (performance.now() - delAb < 500) return;
     disarmDelete();
     const id = editingId;
     b.disabled = true; deletingId = id;
@@ -861,13 +862,15 @@
     if (!btn.classList.contains("armed")) return;
     clearTimeout(btn._t); btn.classList.remove("armed"); btn.textContent = btn._was;
   }
+  // Der zweite Tipp zählt erst nach einer halben Sekunde, damit ein versehentlicher Doppeltipp nicht gleich bestätigt
   function confirmClick(btn, label, fn) {
     if (!btn.classList.contains("armed")) {
-      btn._was = btn.textContent;
+      btn._was = btn.textContent; btn._ab = performance.now();
       btn.classList.add("armed"); btn.textContent = label;
       btn._t = setTimeout(() => disarm(btn), 4000);
       return;
     }
+    if (performance.now() - btn._ab < 500) return;
     disarm(btn); fn();
   }
   // teamGen zählt das Öffnen und Schließen mit: Antworten für ein schon geschlossenes Fenster werden verworfen
@@ -934,7 +937,7 @@
         el("span", { class: "ps", "data-s": p.status }, st));
       const ren = el("button", { class: "btn", type: "button", onclick: () => renameRow(li, p) }, "Umbenennen");
       li.append(self ? el("span", { class: "pa" }, ren) : promote ? el("span", { class: "pa" },
-        el("button", { class: "btn", type: "button", onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich? Nur für dich", () =>
+        el("button", { class: "btn", type: "button", onclick: (ev) => confirmClick(ev.currentTarget, `Ja, ich bin ${p.name.length > 16 ? p.name.slice(0, 15) + "…" : p.name}`, () =>
           teamAct({ aktion: "admin_setzen", person: p.id, admin: true }, () => {
             teamDlg.close(); checkMe();
             toast(`${p.name} verwaltet jetzt. Zum Verwalten mit dem eigenen Namen anmelden.`);

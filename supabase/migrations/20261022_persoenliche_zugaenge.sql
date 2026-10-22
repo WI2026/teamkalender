@@ -105,12 +105,13 @@ $$;
 
 -- Das Team-Konto verwaltet nur in der Team-Phase. Jede Verwaltungs-Aktion prüft das im selben Aufruf noch einmal;
 -- die Sperre auf dem Stand ordnet sie gegen das gleichzeitige Ende der Team-Phase (dann gilt ein eben erzeugter Verwalter-Code nicht).
+-- Alle Aktionen, die Stand und Personen sperren, nehmen den Stand zuerst; so können sie sich nicht gegenseitig blockieren.
 create function privat.kalender_team_darf(p_wer text)
 returns void language plpgsql volatile security definer set search_path = ''
 as $$
 begin
   if lower(coalesce(p_wer, '')) <> 'kalender@wattcon-installation.de' then return; end if;
-  perform 1 from privat.kalender_stand for share;
+  perform 1 from privat.kalender_stand for update;
   if not privat.kalender_team_verwaltet() then
     raise exception 'Team-Zugang verwaltet nicht mehr' using errcode = '42501';
   end if;
@@ -367,6 +368,7 @@ returns boolean language plpgsql volatile security definer set search_path = ''
 as $$
 declare v_name text;
 begin
+  perform 1 from privat.kalender_stand for update;
   perform privat.kalender_team_darf(p_wer);
   update privat.kalender_personen set admin = coalesce(p_admin, false) where id = p_person returning name into v_name;
   if v_name is null then return false; end if;
@@ -415,7 +417,8 @@ begin
   if not found then
     insert into privat.kalender_fehlversuche (stunde, absender, anzahl) values (v_std, v_abs, 1)
       on conflict (stunde, absender) do update set anzahl = privat.kalender_fehlversuche.anzahl + 1;
-    delete from privat.kalender_fehlversuche where stunde < now() - interval '2 days';
+    -- gezählt wird nur die laufende Stunde, ältere Zeilen braucht niemand mehr
+    delete from privat.kalender_fehlversuche where stunde < v_std;
     return jsonb_build_object('ok', false, 'fehler', 'falsch');
   end if;
   if p.code_bis <= now() then return jsonb_build_object('ok', false, 'fehler', 'abgelaufen'); end if;
@@ -437,6 +440,7 @@ returns boolean language plpgsql volatile security definer set search_path = ''
 as $$
 declare p privat.kalender_personen;
 begin
+  perform 1 from privat.kalender_stand for update;
   select * into p from privat.kalender_personen where id = p_person for update;
   if not found or p.code_hash is null or p.code_bis <= now() or p.code_hash <> privat.kalender_code_hash(p_code) then return false; end if;
   if p_user is distinct from privat.kalender_konto(p_person) then return false; end if;
