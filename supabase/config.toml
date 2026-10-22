@@ -1,0 +1,3 @@
+# Die Funktion prüft Anmeldungen selbst: „einrichten“ kommt von der Anmeldeseite ohne Anmeldung.
+[functions.kalender-zugang]
+verify_jwt = false

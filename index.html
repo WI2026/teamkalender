@@ -47,19 +47,17 @@
     <img class="mark" src="mark.svg" alt="" width="48" height="47">
     <h1>Eigenes Passwort festlegen</h1>
     <p>Den Einmal-Code bekommst du persönlich von der Kalender-Verwaltung. Er gilt 7 Tage und nur einmal.</p>
-    <label class="sr" for="setupName">Name</label>
-    <select id="setupName" class="login-select"></select>
-    <input type="text" id="setupUser" class="sr" autocomplete="username" tabindex="-1" aria-hidden="true" readonly>
     <label class="sr" for="setupCode">Einmal-Code</label>
     <input type="text" id="setupCode" placeholder="Einmal-Code, z. B. K7MP-2QXA" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="12">
     <label class="sr" for="setupPw">Neues Passwort</label>
     <input type="password" id="setupPw" autocomplete="new-password" placeholder="Neues Passwort">
     <label class="sr" for="setupPw2">Passwort wiederholen</label>
     <input type="password" id="setupPw2" autocomplete="new-password" placeholder="Passwort wiederholen">
-    <p class="hint">Mindestens 10 Zeichen. Gut merkbar und sicher ist ein kurzer Satz, etwa „Montag kommt der Zählerschrank“.</p>
+    <p class="hint">Mindestens 10 Zeichen, am besten ein eigener kurzer Satz. Nicht das bisherige Team-Passwort.</p>
     <div class="err" id="setupErr" role="alert"></div>
     <button class="btn primary" id="setupBtn" type="submit">Passwort festlegen</button>
     <button class="linkbtn" id="backLink" type="button">Zurück zur Anmeldung</button>
+    <p class="login-foot">Code abgelaufen oder schon benutzt? Dann bei der Verwaltung einen neuen holen.</p>
   </form>
 </div>
 
@@ -184,8 +182,9 @@
       <strong class="code num" id="codeVal"></strong>
       <span id="codeUntil"></span>
     </div>
+    <p class="hint" id="adminTip" hidden>Tipp: Gib einer zweiten Person das Verwalter-Recht. Vergisst der einzige Verwalter sein Passwort, kann sonst niemand mehr neue Codes erzeugen.</p>
     <div class="teamoff" id="teamOff" hidden>
-      <p class="hint">Das gemeinsame Team-Passwort funktioniert noch. Wenn alle ihr eigenes haben, schalte es ab. Wer es kennt, kommt danach nicht mehr hinein.</p>
+      <p class="hint" id="teamOffHint">Das gemeinsame Team-Passwort funktioniert noch. Wenn alle ihr eigenes haben, schalte es ab. Wer es kennt, kommt danach nicht mehr hinein.</p>
       <button class="btn danger" id="teamOffBtn" type="button">Team-Passwort abschalten</button>
     </div>
     <div class="err" id="teamErr" role="alert"></div>

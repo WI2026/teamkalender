@@ -12,12 +12,16 @@
   const CP = { 0x20ac: 0x80, 0x201a: 0x82, 0x0192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87, 0x02c6: 0x88, 0x2030: 0x89, 0x0160: 0x8a,
     0x2039: 0x8b, 0x0152: 0x8c, 0x017d: 0x8e, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
     0x02dc: 0x98, 0x2122: 0x99, 0x0161: 0x9a, 0x203a: 0x9b, 0x0153: 0x9c, 0x017e: 0x9e, 0x0178: 0x9f };
-  // Text als Folge von Windows-1252-Codes; Steuerzeichen werden Leerzeichen, Unbekanntes „?“
+  // Text als Folge von Windows-1252-Codes; Steuerzeichen werden Leerzeichen, unsichtbare Formatzeichen (etwa aus kopierten
+  // Telefonnummern) entfallen, geschützte Leerzeichen bleiben geschützt, Unbekanntes wird „?“
+  const FORMAT = /^[\p{Cf}\u00ad]$/u, NOBREAK = /^[\u2007\u202f]$/u, SPACE = /^[\p{Zs}\p{Zl}\p{Zp}]$/u, CTRL = /^\p{Cc}$/u;
   function codes(s) {
     const out = [];
     for (const ch of String(s).normalize("NFC")) {
       const u = ch.codePointAt(0);
-      if (u < 32 || u === 127) { out.push(32); continue; }
+      if (u === 0xa0 || NOBREAK.test(ch)) { out.push(0xa0); continue; }
+      if (FORMAT.test(ch)) continue;
+      if (CTRL.test(ch) || (SPACE.test(ch) && u !== 32)) { out.push(32); continue; }
       if (u < 127 || (u >= 0xa0 && u <= 0xff)) { out.push(u); continue; }
       const base = ch.normalize("NFD").codePointAt(0);   // etwa Ź → Z, Ż → Z
       out.push(CP[u] || (base < 127 && base >= 32 ? base : 63));
@@ -31,7 +35,7 @@
   // Zeilenumbruch an Leerzeichen; zu lange Wörter werden hart getrennt
   function wrap(text, font, size, maxW) {
     const lines = [];
-    for (const para of String(text).replace(/\r\n?/g, "\n").split("\n")) {
+    for (const para of String(text).replace(/\r\n?|[\u0085\u2028\u2029]/g, "\n").split("\n")) {
       const words = codes(para).reduce((ws, c) => { if (c === 32) ws.push([]); else ws[ws.length - 1].push(c); return ws; }, [[]]);
       let line = [];
       for (let w of words) {
@@ -40,8 +44,10 @@
         if (widthOf(cand, font, size) <= maxW) { line = cand; continue; }
         if (line.length) { lines.push(line); line = []; }
         while (widthOf(w, font, size) > maxW) {
-          let n = w.length - 1;
-          while (n > 1 && widthOf(w.slice(0, n), font, size) > maxW) n--;
+          // so viele Zeichen wie in die Zeile passen, mindestens eines
+          let n = 0, acc = 0;
+          while (n < w.length && (acc += W[font][w[n] - 32] * size / 1000) <= maxW) n++;
+          n = Math.max(n, 1);
           lines.push(w.slice(0, n)); w = w.slice(n);
         }
         line = w;
@@ -82,10 +88,13 @@
         text(M, y - 11, "F2", 11.5, INK, codes(day.heading + (cont ? " (Fortsetzung)" : "")));
         rule(M, A4[0] - M, y - 16, LINE, 0.6); y -= headH - 6;
       };
+      const usable = A4[1] - M - BOTTOM - headH;
       for (const r of day.rows) {
         const tl = wrap(r.title, "F2", 10.5, TW - 12), ml = wrap(r.meta, "F1", 8.5, TW), nl = r.note ? wrap(r.note, "F1", 9, TW) : [];
         const h = tl.length * 13.5 + ml.length * 11 + nl.length * 11.5 + 9;
-        if (first ? !fits(h + headH) : !fits(h)) { newPage(); head(!first); }
+        // Ein Termin bleibt zusammen, wenn er auf eine Seite passt; sonst läuft eine lange Notiz auf der nächsten Seite weiter
+        const need = h <= usable ? h : tl.length * 13.5 + ml.length * 11 + 3 * 11.5 + 9;
+        if (first ? !fits(need + headH) : !fits(need)) { newPage(); head(!first); }
         else if (first) head(false);
         first = false;
         let yy = y - 10.5;
@@ -94,8 +103,14 @@
         tl.forEach((l, i) => text(TX + 12, yy - i * 13.5, "F2", 10.5, INK, l));
         yy -= (tl.length - 1) * 13.5 + 12.5;
         ml.forEach((l) => { text(TX, yy, "F1", 8.5, GREY, l); yy -= 11; });
-        nl.forEach((l) => { text(TX, yy, "F1", 9, INK, l); yy -= 11.5; });
-        y -= h;
+        nl.forEach((l) => {
+          if (yy - 11 < BOTTOM) {
+            newPage(); head(true); yy = y - 10.5;
+            text(TX, yy, "F1", 8.5, GREY, codes("Fortsetzung der Notiz")); yy -= 11;
+          }
+          text(TX, yy, "F1", 9, INK, l); yy -= 11.5;
+        });
+        y = yy + 0.5;
       }
     }
 

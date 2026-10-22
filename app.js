@@ -518,6 +518,8 @@
     state.canWrite = true;
     setStatus("live", "Live", "für alle sichtbar"); $("banner").hidden = true;
     afterChange();
+    // Ein entzogener Zugang liefert keine Fehler, sondern nur noch leere Monate. Daher regelmäßig nachfragen.
+    if (Date.now() - meAt > 60 * 1000) checkMe();
   }
   // Beim Blättern kurz warten, damit schnelles Klicken nicht jeden Monat einzeln lädt.
   rangeHook = () => {
@@ -536,14 +538,21 @@
     if (!sb || isLocked() || !window.KalPDF) return;
     state.pdfBusy = true; $("pdfBtn").disabled = true;
     try {
-      const now = new Date(), first = new Date(now.getFullYear(), now.getMonth(), 1), rows = [];
-      for (let off = 0; ; off += PAGE) {
-        const { data, error } = await sb.from(T).select(COLS).gte("date", ymd(first)).order("date").order("id").range(off, off + PAGE - 1);
+      // Erst prüfen, ob der Zugang noch besteht; sonst entstünde ein leeres PDF, das wie ein leerer Kalender aussieht.
+      if (await checkMe() === "weg") return;
+      const now = new Date(), first = new Date(now.getFullYear(), now.getMonth(), 1), got = new Map();
+      // Seitenweise nach (Datum, id) weiterlesen: so fehlt kein Termin und keiner kommt doppelt, auch wenn gerade jemand ändert.
+      for (let last = null; ;) {
+        let q = sb.from(T).select(COLS).gte("date", ymd(first)).order("date").order("id").limit(PAGE);
+        if (last) q = q.or(`date.gt.${last.date},and(date.eq.${last.date},id.gt.${last.id})`);
+        const { data, error } = await q;
         if (error) throw error;
-        rows.push(...data);
+        for (const r of data) got.set(r.id, r);
         if (data.length < PAGE) break;
+        last = data[data.length - 1];
       }
       if (isLocked()) return;
+      const rows = [...got.values()];
       const who = state.person, whoName = who ? ($("personFilter").selectedOptions[0] || {}).textContent || who : "";
       const byDay = new Map();
       for (const r of rows) {
@@ -559,7 +568,7 @@
         count += list.length;
         return { heading: `${longDate(d)} ${d.getFullYear()} · KW ${isoWeek(d)}${hol ? " · " + hol : ""}`,
           rows: list.map((e) => ({ time: timeLabel(e), title: e.title, meta: `${catLabel(e.cat)} · eingetragen von ${e.person || "–"}`,
-            note: e.note, color: PDF_COLOR[e.cat] || PDF_COLOR.buero })) };
+            note: e.note, color: Object.hasOwn(PDF_COLOR, e.cat) ? PDF_COLOR[e.cat] : PDF_COLOR.buero })) };
       });
       const stand = `${pad(now.getDate())}.${pad(now.getMonth() + 1)}.${now.getFullYear()}, ${pad(now.getHours())}:${pad(now.getMinutes())} Uhr`;
       const bytes = window.KalPDF.build({
@@ -574,7 +583,7 @@
       const a = el("a", { href: url, download: `Teamkalender_Stand_${ymd(now)}_${pad(now.getHours())}${pad(now.getMinutes())}.pdf` });
       document.body.append(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast(count ? "PDF wird gespeichert" : "PDF gespeichert, ab diesem Monat ist nichts eingetragen");
+      toast(count ? "PDF wird gespeichert" : whoName ? `PDF gespeichert, ${whoName} hat ab diesem Monat keine Termine` : "PDF gespeichert, ab diesem Monat ist nichts eingetragen");
     } catch (err) {
       if (loggedOut(err)) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
       else toast("PDF ging nicht. Prüfe die Internetverbindung und versuche es erneut.");
@@ -654,13 +663,24 @@
     $("teamBtn").hidden = !me || !me.admin || isLocked();
   }
   // Fragt die Datenbank, ob dieses Konto (noch) Zugang hat und wie die Person heißt. Ohne Verbindung bleibt alles, wie es ist.
+  // Antwort: "ok", "weg" (abgemeldet) oder "offen" (keine Antwort).
+  let meAt = 0, meSeq = 0, myEmail = "";
   async function checkMe() {
+    const seq = ++meSeq;
     let r;
-    try { r = await sb.rpc("kalender_ich"); } catch { return; }
-    if (isLocked()) return;
-    if (r.error) { if (loggedOut(r.error)) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return; }
-    if (!r.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return; }
-    state.me = r.data; showMe();
+    try { r = await sb.rpc("kalender_ich"); } catch { return "offen"; }
+    if (isLocked()) return "weg";
+    if (seq !== meSeq) return "offen";
+    if (r.error) { if (loggedOut(r.error)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return "weg"; } return "offen"; }
+    if (!r.data) { accessGone(); return "weg"; }
+    meAt = Date.now(); state.me = r.data; showMe();
+    return "ok";
+  }
+  // Zugang entzogen (gesperrt, neuer Code, Team-Passwort abgeschaltet) oder neues Passwort auf einem anderen Gerät festgelegt
+  function accessGone() {
+    lockOut(myEmail === String(CFG.email).toLowerCase() ? "Das gemeinsame Team-Passwort wurde abgeschaltet. Bitte mit deinem Namen anmelden."
+      : state.me ? "Dein Zugang wurde geändert oder beendet. Bitte neu anmelden oder bei der Verwaltung melden."
+      : "Dieses Konto hat keinen Zugang zum Kalender.");
   }
 
   // ---------- Anmeldung mit Namen ----------
@@ -676,47 +696,41 @@
     try { r = await sb.rpc("kalender_namen"); } catch (e) { r = { error: e }; }
     if (seq !== namesSeq || !isLocked()) return;
     if (r.error || !Array.isArray(r.data)) {
-      if (!names.length) fillNames([]);
+      if (!names.length) fillNames([], false);
       $("loginErr").textContent = "Die Namensliste konnte nicht geladen werden. Prüfe die Internetverbindung.";
       namesT = setTimeout(loadNames, 15000);
       return;
     }
     if (/Namensliste/.test($("loginErr").textContent)) $("loginErr").textContent = "";
     names = r.data;
-    fillNames(names);
+    fillNames(names, true);
   }
   const optVal = (n) => n.team ? "team" : n.id;
-  function fillNames(list) {
-    const last = store.get("kal.loginName") || "";
-    const fill = (sel, arr, empty) => {
-      const keep = sel.value || last;
-      sel.replaceChildren(...(arr.length ? [el("option", { value: "" }, "Name wählen …"), ...arr.map(n => el("option", { value: optVal(n) }, n.name))]
-        : [el("option", { value: "" }, empty)]));
-      if ([...sel.options].some(o => o.value === keep && keep)) sel.value = keep;
-      else if (arr.length === 1) sel.value = optVal(arr[0]);
-    };
-    fill($("loginName"), list.filter(n => n.eingerichtet), names.length || list.length ? "Noch niemand eingerichtet" : "Keine Namen geladen");
-    fill($("setupName"), list.filter(n => !n.team && n.einrichtbar), "Kein offener Code vorhanden");
+  // Zur Auswahl stehen nur Personen mit eigenem Passwort und, solange es ihn gibt, der Team-Zugang
+  function fillNames(list, ok) {
+    const sel = $("loginName"), keep = sel.value || store.get("kal.loginName") || "";
+    sel.replaceChildren(...(list.length ? [el("option", { value: "" }, "Name wählen …"), ...list.map(n => el("option", { value: optVal(n) }, n.name))]
+      : [el("option", { value: "" }, ok ? "Noch niemand eingerichtet" : "Keine Namen geladen")]));
+    if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+    else if (list.length === 1) sel.value = optVal(list[0]);
     syncUser();
   }
   // Für Passwort-Manager: der gewählte Name gilt als Benutzername
   function syncUser() {
-    $("loginUser").value = ($("loginName").selectedOptions[0] || {}).value ? $("loginName").selectedOptions[0].textContent : "";
-    $("setupUser").value = ($("setupName").selectedOptions[0] || {}).value ? $("setupName").selectedOptions[0].textContent : "";
+    const o = $("loginName").selectedOptions[0];
+    $("loginUser").value = o && o.value ? o.textContent : "";
   }
   $("loginName").addEventListener("change", () => { syncUser(); $("loginErr").textContent = ""; });
-  $("setupName").addEventListener("change", syncUser);
   addEventListener("online", () => { if (isLocked()) loadNames(); });
 
   function showSetup(on) {
     $("loginForm").hidden = on; $("setupForm").hidden = !on;
     $("setupErr").textContent = ""; $("loginErr").textContent = "";
     ["setupCode", "setupPw", "setupPw2"].forEach(id => { $(id).value = ""; });
-    if (on) { if (!$("setupName").value) { const ln = $("loginName").value; if ([...$("setupName").options].some(o => o.value === ln && ln)) $("setupName").value = ln; } syncUser(); }
-    if (on) setTimeout(() => ($("setupName").value ? $("setupCode") : $("setupName")).focus(), 30);
+    if (on) setTimeout(() => $("setupCode").focus(), 30);
   }
-  $("setupLink").addEventListener("click", () => { showSetup(true); loadNames(); });
-  $("backLink").addEventListener("click", () => { showSetup(false); $("loginPw").focus(); });
+  $("setupLink").addEventListener("click", () => showSetup(true));
+  $("backLink").addEventListener("click", () => { showSetup(false); loadNames(); $("loginPw").focus(); });
 
   // Anmelden mit Adresse und Passwort, danach prüfen, ob das Konto in den Kalender darf
   async function signIn(email, pw) {
@@ -724,10 +738,12 @@
     try { ({ data, error } = await sb.auth.signInWithPassword({ email, password: pw })); } catch (e) { error = e; }
     if (error) return error;
     if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
+    myEmail = data.session.user.email.toLowerCase();
     let me;
     try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
     if (!me.error && !me.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return null; }
     state.me = me.error ? null : me.data;
+    meAt = me.error ? 0 : Date.now();
     loginStamp.set(Date.now());
     enter();
     return null;
@@ -736,7 +752,7 @@
     ev.preventDefault();
     if (!sb) return;
     const sel = $("loginName").value, pw = $("loginPw").value;
-    const who = names.find(n => optVal(n) === sel && n.eingerichtet);
+    const who = names.find(n => optVal(n) === sel);
     if (!who) { $("loginErr").textContent = "Bitte deinen Namen wählen."; $("loginName").focus(); return; }
     if (!pw) { $("loginErr").textContent = "Bitte das Passwort eingeben."; $("loginPw").focus(); return; }
     $("loginBtn").disabled = true; $("loginErr").textContent = "";
@@ -744,6 +760,7 @@
     try { error = await signIn(who.email, pw); } finally { $("loginBtn").disabled = false; }
     if (error) {
       const msg = error.status === 429 ? "Zu viele Versuche. Bitte ein paar Minuten warten."
+        : error.code === "user_banned" ? "Dieser Zugang ist gesperrt. Bitte bei der Verwaltung einen neuen Code holen."
         : /invalid/i.test(error.message || "") ? "Das Passwort stimmt nicht."
         : "Anmelden hat nicht geklappt. Prüfe die Internetverbindung.";
       $("loginErr").textContent = msg; $("loginPw").value = ""; $("loginPw").focus(); return;
@@ -752,43 +769,43 @@
     $("loginPw").value = "";
   });
 
-  // Erstes oder neues Passwort mit Einmal-Code festlegen
+  // Erstes oder neues Passwort mit Einmal-Code festlegen. Wem der Code gehört, weiß nur der Server.
   const SETUP_MSG = {
-    falsch: "Der Code stimmt nicht. Nach 5 Fehlversuchen wird er ungültig.",
-    gesperrt: "Der Code wurde zu oft falsch eingegeben und gilt nicht mehr. Bitte einen neuen anfordern.",
-    abgelaufen: "Der Code ist abgelaufen. Bitte einen neuen anfordern.",
-    kein_code: "Für diesen Namen gibt es keinen offenen Code. Bitte bei der Verwaltung melden.",
+    falsch: "Der Code stimmt nicht. Bitte genau abtippen, etwa K7MP-2QXA.",
+    abgelaufen: "Der Code ist abgelaufen. Bitte bei der Verwaltung einen neuen holen.",
+    kein_code: "Der Code gilt nicht mehr. Bitte bei der Verwaltung einen neuen holen.",
+    zu_viele: "Gerade wurden zu viele falsche Codes eingegeben. Bitte in einer Stunde erneut versuchen.",
     passwort_kurz: "Das Passwort braucht mindestens 10 Zeichen.",
     passwort_lang: "Das Passwort ist zu lang. Bitte ein kürzeres wählen.",
     passwort_schwach: "Dieses Passwort ist zu leicht zu erraten. Bitte ein anderes wählen.",
-    eingabe: "Bitte Namen und den 8-stelligen Code prüfen.",
+    passwort_wie_team: "Bitte nicht das bisherige Team-Passwort nehmen, sondern ein eigenes.",
+    eingabe: "Bitte den 8-stelligen Code prüfen.",
   };
   $("setupForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (!sb || !FN) return;
-    const id = $("setupName").value, code = $("setupCode").value.toUpperCase().replace(/[^0-9A-Z]/g, "");
+    const code = $("setupCode").value.toUpperCase().replace(/[^0-9A-Z]/g, "");
     const pw = $("setupPw").value, pw2 = $("setupPw2").value;
-    const who = names.find(n => !n.team && n.id === id);
-    const err = !who ? "Bitte deinen Namen wählen." : code.length !== 8 ? "Der Code hat 8 Zeichen, etwa K7MP-2QXA."
+    const err = code.length !== 8 ? "Der Code hat 8 Zeichen, etwa K7MP-2QXA."
       : pw.length < 10 ? SETUP_MSG.passwort_kurz : pw !== pw2 ? "Die beiden Passwörter sind nicht gleich." : "";
     if (err) { $("setupErr").textContent = err; return; }
     $("setupBtn").disabled = true; $("setupErr").textContent = "";
     let res = null, out = null;
     try {
       res = await fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key },
-        body: JSON.stringify({ aktion: "einrichten", person: id, code, passwort: pw }) });
+        body: JSON.stringify({ aktion: "einrichten", code, passwort: pw }) });
       out = await res.json().catch(() => null);
     } catch {}
-    if (!res || !res.ok || !out || !out.ok) {
+    if (!res || !res.ok || !out || !out.ok || !out.email) {
       $("setupBtn").disabled = false;
       $("setupErr").textContent = !res ? "Keine Verbindung. Prüfe das Internet und versuche es erneut."
         : SETUP_MSG[out && out.fehler] || "Das hat nicht geklappt. Bitte später erneut versuchen.";
       if (out && /^passwort/.test(out.fehler)) { $("setupPw").value = $("setupPw2").value = ""; $("setupPw").focus(); }
-      if (out && /^(gesperrt|abgelaufen|kein_code)$/.test(out.fehler)) loadNames();
+      else if (out && /^(falsch|abgelaufen|kein_code|eingabe)$/.test(out.fehler)) $("setupCode").select();
       return;
     }
     // Passwort steht: gleich damit anmelden
-    store.set("kal.loginName", id);
+    if (out.id) store.set("kal.loginName", String(out.id));
     let error;
     try { error = await signIn(out.email, pw); } finally { $("setupBtn").disabled = false; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
@@ -802,8 +819,11 @@
   // ---------- Team und Zugänge (nur Verwaltung) ----------
   const teamDlg = $("teamDlg");
   async function teamCall(body) {
-    const { data } = await sb.auth.getSession();
-    const tok = data && data.session && data.session.access_token;
+    let s;
+    try { s = await sb.auth.getSession(); } catch { throw { status: 0 }; }
+    // Erneuern ohne Netz schlägt fehl, ist aber kein Abmelden
+    if (s.error) throw { status: 0 };
+    const tok = s.data && s.data.session && s.data.session.access_token;
     if (!tok) throw { status: 401 };
     let res;
     try {
@@ -816,54 +836,80 @@
   const TEAM_MSG = {
     keine_rechte: "Du darfst das Team nicht verwalten.",
     selbst: "Das geht nicht für deinen eigenen Zugang.",
+    team_nicht: "Personen mit eigenem Passwort verwaltet nur eine Person mit Verwalter-Recht, nicht der Team-Zugang.",
     name: "Bitte einen Namen mit höchstens 40 Zeichen eingeben, der nicht mit „Team“ beginnt.",
     name_vergeben: "Diesen Namen gibt es schon.",
     kein_verwalter: "Erst muss eine Person mit eigenem Passwort das Team verwalten dürfen.",
     unbekannt: "Diese Person gibt es nicht mehr.",
+    server: "Der Server ist gerade gestört. Bitte gleich noch einmal versuchen.",
   };
   function teamFail(e) {
     if (e && e.status === 401) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return; }
     $("teamErr").textContent = TEAM_MSG[e && e.fehler] || "Das hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
     if (e && e.fehler === "keine_rechte") checkMe();
   }
-  const fmtDay = (iso) => { const t = new Date(tsOf(iso)); return isNaN(t) ? "" : `${pad(t.getDate())}.${pad(t.getMonth() + 1)}.${t.getFullYear()}`; };
+  const fmtWhen = (iso) => { const t = new Date(tsOf(iso)); return isNaN(t) ? "" : `${pad(t.getDate())}.${pad(t.getMonth() + 1)}.${t.getFullYear()}, ${pad(t.getHours())}:${pad(t.getMinutes())} Uhr`; };
   // Zweistufig wie beim Löschen: erst „Wirklich?“, dann ausführen
+  function disarm(btn) {
+    if (!btn.classList.contains("armed")) return;
+    clearTimeout(btn._t); btn.classList.remove("armed"); btn.textContent = btn._was;
+  }
   function confirmClick(btn, label, fn) {
     if (!btn.classList.contains("armed")) {
-      const was = btn.textContent;
+      btn._was = btn.textContent;
       btn.classList.add("armed"); btn.textContent = label;
-      btn._t = setTimeout(() => { btn.classList.remove("armed"); btn.textContent = was; }, 4000);
+      btn._t = setTimeout(() => disarm(btn), 4000);
       return;
     }
-    clearTimeout(btn._t); fn();
+    disarm(btn); fn();
   }
-  let teamBusy = false;
+  // teamGen zählt das Öffnen und Schließen mit: Antworten für ein schon geschlossenes Fenster werden verworfen
+  let teamBusy = false, teamGen = 0, offOk = false;
+  function hideCode() { $("codeVal").textContent = ""; $("codeFor").textContent = ""; $("codeUntil").textContent = ""; $("codeBox").hidden = true; }
   async function teamAct(body, done) {
     if (teamBusy) return;
-    teamBusy = true; $("teamErr").textContent = "";
+    const gen = teamGen;
+    teamBusy = true; $("teamErr").textContent = ""; hideCode();
     teamDlg.querySelectorAll("button").forEach(b => { if (b.id !== "teamClose") b.disabled = true; });
-    try { const r = await teamCall(body); if (done) done(r); await loadTeam(); }
-    catch (e) { teamFail(e); }
-    finally { teamBusy = false; teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; }); }
+    try {
+      const r = await teamCall(body);
+      if (gen !== teamGen || !teamDlg.open || isLocked()) return;
+      if (done) done(r);
+      await loadTeam();
+    }
+    catch (e) { if (gen === teamGen) teamFail(e); }
+    finally {
+      teamBusy = false;
+      teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; });
+      $("teamOffBtn").disabled = !offOk;
+    }
   }
   function showCode(name, code, bis) {
     $("codeFor").textContent = `Einmal-Code für ${name}`;
     $("codeVal").textContent = code.slice(0, 4) + "-" + code.slice(4);
-    $("codeUntil").textContent = `Gültig bis ${fmtDay(bis)}, nur einmal. Persönlich weitergeben.`;
+    $("codeUntil").textContent = `Gültig bis ${fmtWhen(bis)}, nur einmal. Persönlich weitergeben.`;
     $("codeBox").hidden = false;
   }
+  const STATUS = {
+    aktiv: () => "Eigenes Passwort aktiv",
+    code: (p) => `Code offen bis ${fmtWhen(p.code_bis)}`,
+    abgelaufen: (p) => `Code abgelaufen am ${fmtWhen(p.code_bis)}`,
+    gesperrt: () => "Gesperrt",
+  };
   async function loadTeam() {
+    const gen = teamGen;
     let d;
-    try { d = await teamCall({ aktion: "liste" }); } catch (e) { teamFail(e); return; }
-    if (!teamDlg.open) return;
+    try { d = await teamCall({ aktion: "liste" }); } catch (e) { if (gen === teamGen) teamFail(e); return; }
+    if (gen !== teamGen || !teamDlg.open || isLocked()) return;
     const ich = d.ich;
     $("people").replaceChildren(...(d.personen.length ? d.personen.map(p => {
-      const self = !!ich && p.email === ich;
-      const st = p.status === "aktiv" ? "Eigenes Passwort aktiv" : p.status === "code" ? `Code offen bis ${fmtDay(p.code_bis)}` : "Gesperrt";
+      const self = !!ich && p.email === ich, st = (STATUS[p.status] || STATUS.gesperrt)(p);
+      // Der Team-Zugang richtet nur ein: Personen mit eigenem Passwort ändert nur, wer selbst verwalten darf
+      const locked = d.team && p.eingerichtet;
       return el("li", null,
         el("span", { class: "pn" }, p.name + (p.admin ? " · verwaltet" : "") + (self ? " (du)" : "")),
         el("span", { class: "ps", "data-s": p.status }, st),
-        self ? null : el("span", { class: "pa" },
+        self ? null : locked ? el("span", { class: "pa note" }, "Ändern nur mit eigenem Verwalter-Zugang") : el("span", { class: "pa" },
           el("button", { class: "btn", type: "button", onclick: (ev) => {
             const go = () => teamAct({ aktion: "neuer_code", person: p.id }, (r) => showCode(p.name, r.code, r.bis));
             if (p.status === "aktiv") confirmClick(ev.currentTarget, "Altes Passwort sperren?", go); else go();
@@ -874,17 +920,23 @@
           el("button", { class: "btn danger", type: "button",
             onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich entfernen?", () => teamAct({ aktion: "entfernen", person: p.id }, () => toast(`${p.name} ist entfernt, die Termine bleiben`))) }, "Entfernen")));
     }) : [el("li", { class: "empty" }, "Noch niemand angelegt. Lege zuerst dich selbst an und erlaube dir das Verwalten.")]));
+    $("adminTip").hidden = d.verwalter !== 1;
+    offOk = !!ich && !!d.team_aktiv;
     $("teamOff").hidden = !d.team_aktiv;
-    $("teamOffBtn").disabled = !ich;
-    $("teamOffBtn").title = ich ? "" : "Melde dich dafür mit deinem eigenen Namen an";
+    $("teamOffBtn").disabled = !offOk;
+    $("teamOffHint").textContent = ich ? "Das gemeinsame Team-Passwort funktioniert noch. Wenn alle ihr eigenes haben, schalte es ab. Wer es kennt, kommt danach nicht mehr hinein."
+      : "Das gemeinsame Team-Passwort funktioniert noch. Abschalten kann es nur, wer mit dem eigenen Namen angemeldet ist und verwalten darf.";
   }
   $("teamBtn").addEventListener("click", () => {
-    $("teamErr").textContent = ""; $("codeBox").hidden = true; $("people").replaceChildren(); $("teamOff").hidden = true;
+    $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
+    disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
     teamDlg.showModal(); loadTeam();
   });
   $("teamClose").addEventListener("click", () => teamDlg.close());
   // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
-  teamDlg.addEventListener("close", () => { $("codeVal").textContent = ""; $("codeBox").hidden = true; $("people").replaceChildren(); $("addForm").reset(); });
+  teamDlg.addEventListener("close", () => {
+    teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn"));
+  });
   $("addForm").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const name = $("addName").value.replace(/\s+/g, " ").trim(), admin = $("addAdmin").checked;
@@ -906,7 +958,7 @@
     const { data } = await sb.auth.getSession();
     const stamp = loginStamp.get();
     if (data.session && !kalUser(data.session)) lockOut();
-    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) { enter(); checkMe(); }
+    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) { myEmail = data.session.user.email.toLowerCase(); enter(); checkMe(); }
     else if (data.session) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
     else showLogin();
   })();
