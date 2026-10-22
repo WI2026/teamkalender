@@ -180,7 +180,7 @@ select.filter {
   font-size: 12px; line-height: 1.35; border: 0; text-align: left; cursor: pointer; width: 100%;
   background: color-mix(in srgb, var(--c) 13%, transparent); color: var(--fg);
 }
-.chip .t { font-family: var(--font-data); font-size: 10.5px; color: color-mix(in srgb, var(--c) 60%, var(--fg)); flex: none; }
+.chip .t { font-family: var(--font-data); font-size: 10.5px; color: color-mix(in srgb, var(--c) 50%, var(--fg)); flex: none; }
 .chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .chip.allday { background: var(--c); color: var(--surface); font-weight: 560; }
 .more { font-size: 11px; color: var(--fg-3); padding-left: 6px; }
@@ -426,3 +426,5 @@ body.locked .app { display: none; }
 #bg3d { z-index: -1; }
 /* Gedruckt wird nur der Kalender, ohne Hintergrundbild */
 @media print { #bgfx, #bg3d { display: none !important; } }
+/* Wechsel der Kopfzeilenfarben, wenn das Foto erscheint: ohne Übergänge, sonst blitzt kurz dunkle Schrift auf dem Foto auf */
+.bg-ton-wechsel :is(.top, .toolbar, .banner), .bg-ton-wechsel :is(.top, .toolbar, .banner) * { transition: none !important; }

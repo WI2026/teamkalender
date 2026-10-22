@@ -246,7 +246,7 @@
     const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return null;
     let img = null, key = "";
-    canvas.addEventListener("contextrestored", () => { key = ""; });   // Inhalt nach einem Grafikabsturz weg: neu zeichnen
+    canvas.addEventListener("contextrestored", () => { key = ""; }, true);   // Grafikabsturz: neu zeichnen; Erfassungsphase, damit es vor dem redraw() in bg.js läuft
     return {
       kind: "2d",
       ready: () => !!img,
@@ -278,7 +278,7 @@
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     on.style.transition = "none"; on.style.opacity = "0";   // ohne Übergang, sonst blendet die leere Leinwand erst aus
     let disposed = false, last = null, want = null, v = null, asp = 16 / 9, scale = 1, tries = 0, retryT = 0, toneT = 0, failed = false;
-    let chosen = null, pickW = 0;
+    let chosen = null, pickW = 0, pickH = 0;   // pickH: größte Höhe bei dieser Breite
     const coarse = matchMedia("(pointer: coarse)");
     // Dunkles Foto (Abendszene): Kopfzeile und Werkzeugleiste stehen direkt darauf und werden hell (style.css,
     // data-bg-ton), der Schleier bleibt Navy und die Browserleiste färbt sich passend. Erst wenn das Foto da ist.
@@ -286,7 +286,9 @@
     const metas = Array.from(document.querySelectorAll('meta[name="theme-color"]')), metaWas = metas.map((m) => m.content);
     function tone(onOff) {
       if (!night) return;
+      root.classList.add("bg-ton-wechsel");   // Farbwechsel der Leisten ohne Übergänge, sonst blitzt dunkle Schrift auf
       if (onOff) root.setAttribute("data-bg-ton", "dunkel"); else root.removeAttribute("data-bg-ton");
+      requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("bg-ton-wechsel")));
       metas.forEach((m, i) => { m.content = onOff ? NAVY : metaWas[i]; });
     }
     // Helle Karten deckender, sobald das dunkle Foto sichtbar wird (style.css, data-bg-foto), sonst wirken sie grau
@@ -297,12 +299,13 @@
     // Beim Drucken fehlt das Foto (style.css), die Kopfzeile braucht dann wieder ihre normalen Farben
     const beforePrint = () => { tone(false); photo(false); }, afterPrint = () => { if (!disposed && v) { tone(true); photo(true); } };
     addEventListener("beforeprint", beforePrint); addEventListener("afterprint", afterPrint);
-    // Hochformat-Foto, wenn es eins gibt und der Bildschirm hoch ist (Handy); sonst das Querformat. Zwischen den
-    // Schwellen bleibt das gewählte Foto, und auf Touch-Geräten ändert nur eine neue Breite die Wahl: die Tastatur
-    // oder die Leisten des Browsers verkleinern bloß die Höhe und sollen das Foto nicht tauschen.
+    // Hochformat-Foto, wenn es eins gibt und der Bildschirm hoch ist (Handy); sonst das Querformat. Neue Breite (Drehen,
+    // Fenster ziehen): neu wählen. Gleiche Breite: zwischen den Schwellen bleibt das gewählte Foto, und auf Touch-Geräten
+    // zählt die volle Höhe, denn Tastatur und Browserleisten nehmen nur Höhe weg und sollen das Foto nicht tauschen.
     const variantFor = (w, h) => {
       if (!cfg.tall) return cfg.wide;
-      if (chosen && w === pickW && coarse.matches) return chosen;
+      if (!chosen || w !== pickW) return isPhoneLike(w, h) ? cfg.tall : cfg.wide;   // neue Breite (Drehen, Fenster): neu wählen
+      if (coarse.matches) h = Math.max(h, pickH);   // Touch: Tastatur und Leisten nehmen nur Höhe weg, die volle Höhe zählt
       return chosen === cfg.tall ? (w / h < 1 ? cfg.tall : cfg.wide) : (isPhoneLike(w, h) ? cfg.tall : cfg.wide);
     };
     function reveal() {
@@ -322,10 +325,11 @@
       });
     }
     function pick(w, h) {
-      const nv = variantFor(w, h); pickW = w; chosen = nv;
+      const nv = variantFor(w, h); pickH = w === pickW ? Math.max(pickH, h) : h; pickW = w; chosen = nv;
       if (nv === want) return;   // lädt schon, ist schon da oder wartet auf den nächsten Versuch
       want = nv; clearTimeout(retryT);
       if (nv === v) return;      // zurück zum Foto, das schon gezeigt wird
+      failed = false;            // lädt gerade: „online“ startet keinen zweiten Abruf
       Promise.all([loadImage(nv.img), nv.mask ? loadImage(nv.mask) : Promise.resolve(null)]).then(([im, mk]) => {
         if (disposed || want !== nv || !R.setImages(nv, im, mk)) return;
         tries = 0; failed = false; v = nv; asp = im.naturalWidth / im.naturalHeight;
