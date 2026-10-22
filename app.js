@@ -625,6 +625,7 @@
     clearTimeout(navT); clearTimeout(retryT); clearTimeout(firstT); retryMs = 5000;
     if (dlg.open) dlg.close();
     if ($("teamDlg").open) $("teamDlg").close();
+    if ($("logDlg").open) $("logDlg").close();
     state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = ""; state.me = null;
     showMe();
     render();
@@ -778,7 +779,7 @@
 
   // Erstes oder neues Passwort mit Einmal-Code festlegen. Wem der Code gehört, weiß nur der Server.
   const SETUP_MSG = {
-    falsch: "Der Code stimmt nicht. Bitte genau abtippen, etwa K7MP-2QXA.",
+    falsch: "Der Code stimmt nicht. Bitte genau abtippen, etwa K7MPX-2QXA9.",
     abgelaufen: "Der Code ist abgelaufen. Bitte bei der Verwaltung einen neuen holen.",
     kein_code: "Der Code gilt nicht mehr. Bitte bei der Verwaltung einen neuen holen.",
     zu_viele: "Gerade wurden zu viele falsche Codes eingegeben. Bitte in einer Stunde erneut versuchen.",
@@ -786,14 +787,14 @@
     passwort_lang: "Das Passwort ist zu lang. Bitte ein kürzeres wählen.",
     passwort_schwach: "Dieses Passwort ist zu leicht zu erraten. Bitte ein anderes wählen.",
     passwort_wie_team: "Bitte nicht das bisherige Team-Passwort nehmen, sondern ein eigenes.",
-    eingabe: "Bitte den 8-stelligen Code prüfen.",
+    eingabe: "Bitte den 10-stelligen Code prüfen.",
   };
   $("setupForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (!sb || !FN) return;
     const code = $("setupCode").value.toUpperCase().replace(/[^0-9A-Z]/g, "");
     const pw = $("setupPw").value, pw2 = $("setupPw2").value;
-    const err = code.length !== 8 ? "Der Code hat 8 Zeichen, etwa K7MP-2QXA."
+    const err = code.length !== 10 ? "Der Code hat 10 Zeichen, etwa K7MPX-2QXA9."
       : pw.length < 10 ? SETUP_MSG.passwort_kurz : pw !== pw2 ? "Die beiden Passwörter sind nicht gleich." : "";
     if (err) { $("setupErr").textContent = err; return; }
     $("setupBtn").disabled = true; $("setupErr").textContent = "";
@@ -843,7 +844,7 @@
     keine_rechte: "Du darfst das Team nicht verwalten.",
     selbst: "Das geht nicht für deinen eigenen Zugang.",
     team_nicht: "Personen mit eigenem Passwort verwaltet nur eine Person mit Verwalter-Recht, nicht der Team-Zugang.",
-    name: "Bitte einen Namen mit höchstens 40 Zeichen eingeben, der nicht mit „Team“ beginnt.",
+    name: "Bitte einen anderen Namen wählen: höchstens 40 Zeichen, nicht „Team…“, „Datenbank“ oder „System“.",
     name_vergeben: "Diesen Namen gibt es schon.",
     kein_verwalter: "Erst muss eine Person mit eigenem Passwort das Team verwalten dürfen.",
     unbekannt: "Diese Person gibt es nicht mehr.",
@@ -892,57 +893,184 @@
   }
   function showCode(name, code, bis) {
     $("codeFor").textContent = `Einmal-Code für ${name}`;
-    $("codeVal").textContent = code.slice(0, 4) + "-" + code.slice(4);
+    $("codeVal").textContent = code.slice(0, 5) + "-" + code.slice(5);
     $("codeUntil").textContent = `Gültig bis ${fmtWhen(bis)}, nur einmal. Persönlich weitergeben.`;
     $("codeBox").hidden = false;
   }
   const STATUS = {
     aktiv: () => "Eigenes Passwort aktiv",
-    code: (p) => `Code offen bis ${fmtWhen(p.code_bis)}`,
+    code: (p) => `Code offen bis ${fmtWhen(p.code_bis)}` + (p.team_code ? " (aus der Team-Phase)" : ""),
     abgelaufen: (p) => `Code abgelaufen am ${fmtWhen(p.code_bis)}`,
+    neu: () => "Noch kein Code",
     gesperrt: () => "Gesperrt",
   };
+  // Umbenennen direkt in der Zeile, z. B. wenn „User 1“ an eine neue Person geht
+  function renameRow(li, p) {
+    const inp = el("input", { type: "text", maxlength: "40", value: p.name, autocomplete: "off", "aria-label": `Neuer Name für ${p.name}` });
+    li.replaceChildren(el("form", { class: "ren", novalidate: true, onsubmit: (ev) => {
+      ev.preventDefault();
+      const name = inp.value.replace(/\s+/g, " ").trim();
+      if (!name) { $("teamErr").textContent = "Bitte einen Namen eingeben."; inp.focus(); return; }
+      if (name === p.name) { drawTeam(); return; }
+      teamAct({ aktion: "umbenennen", person: p.id, name }, () => toast(`${p.name} heißt jetzt ${name}`));
+    } }, inp,
+      el("span", { class: "pa" }, el("button", { class: "btn primary", type: "submit" }, "Speichern"), el("button", { class: "btn", type: "button", onclick: () => drawTeam() }, "Abbrechen")),
+      p.eingerichtet ? el("span", { class: "ps note" }, "Bekommt jemand anderes diesen Zugang, danach „Neuer Code“ drücken. Dann gilt das alte Passwort nicht mehr.") : null));
+    inp.focus(); inp.select();
+  }
+  let teamData = null;
+  function drawTeam() {
+    const d = teamData;
+    if (!d) return;
+    const ich = d.ich;
+    $("people").replaceChildren(...(d.personen.length ? d.personen.map(p => {
+      const self = !!ich && p.email === ich, st = (STATUS[p.status] || STATUS.gesperrt)(p);
+      // Der Team-Zugang richtet nur ein: Personen mit eigenem Passwort ändert nur, wer selbst verwalten darf.
+      // Ausnahme: das Verwalter-Recht geben (falls sich der Inhaber ohne Häkchen eingerichtet hat); danach verwaltet das Team nie wieder.
+      const locked = d.team && p.eingerichtet;
+      const promote = locked && !p.admin && p.status === "aktiv";
+      const li = el("li", null,
+        el("span", { class: "pn" }, p.name + (p.admin ? " · verwaltet" : "") + (self ? " (du)" : "")),
+        el("span", { class: "ps", "data-s": p.status }, st));
+      const ren = el("button", { class: "btn", type: "button", onclick: () => renameRow(li, p) }, "Umbenennen");
+      li.append(self ? el("span", { class: "pa" }, ren) : promote ? el("span", { class: "pa" },
+        el("button", { class: "btn", type: "button", onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich? Nur für dich", () =>
+          teamAct({ aktion: "admin_setzen", person: p.id, admin: true }, () => {
+            teamDlg.close(); checkMe();
+            toast(`${p.name} verwaltet jetzt. Zum Verwalten mit dem eigenen Namen anmelden.`);
+          })) }, "Verwalten an"))
+        : locked ? el("span", { class: "pa note" }, "Ändern nur mit eigenem Verwalter-Zugang") : el("span", { class: "pa" },
+        el("button", { class: "btn", type: "button", onclick: (ev) => {
+          const go = () => teamAct({ aktion: "neuer_code", person: p.id }, (r) => showCode(p.name, r.code, r.bis));
+          if (p.status === "aktiv") confirmClick(ev.currentTarget, "Altes Passwort sperren?", go); else go();
+        } }, p.status === "neu" ? "Code erzeugen" : "Neuer Code"),
+        p.status === "gesperrt" || p.status === "neu" ? null : el("button", { class: "btn", type: "button",
+          onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich sperren?", () => teamAct({ aktion: "sperren", person: p.id }, () => toast(`${p.name} ist gesperrt`))) }, "Sperren"),
+        el("button", { class: "btn", type: "button", onclick: () => teamAct({ aktion: "admin_setzen", person: p.id, admin: !p.admin }) }, p.admin ? "Verwalten aus" : "Verwalten an"),
+        ren,
+        el("button", { class: "btn danger", type: "button",
+          onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich entfernen?", () => teamAct({ aktion: "entfernen", person: p.id }, () => toast(`${p.name} ist entfernt, die Termine bleiben`))) }, "Entfernen")));
+      return li;
+    }) : [el("li", { class: "empty" }, "Noch niemand angelegt. Lege zuerst dich selbst an und erlaube dir das Verwalten.")]));
+    // Mit dem Team-Passwort: Schritt für Schritt zum eigenen Verwalter-Zugang
+    $("teamStart").hidden = !d.team;
+    $("adminTip").hidden = !ich;
+    $("logBtn").hidden = !ich;
+    offOk = !!ich && !!d.team_aktiv;
+    $("teamOff").hidden = !d.team_aktiv;
+    $("teamOffBtn").disabled = !offOk;
+    const alt = d.personen.filter(p => p.team_code).map(p => p.name);
+    $("teamOffHint").textContent = !ich ? "Das gemeinsame Team-Passwort funktioniert noch. Abschalten kann es nur, wer mit dem eigenen Namen angemeldet ist und verwalten darf."
+      : "Das gemeinsame Team-Passwort funktioniert noch. Schalte es ab, sobald du nicht mehr darauf angewiesen bist. Wer es kennt, kommt danach nicht mehr hinein."
+        + (alt.length ? ` Die offenen Codes aus der Team-Phase (${alt.join(", ")}) werden dabei ungültig; erzeuge danach neue.` : "");
+  }
   async function loadTeam() {
     const gen = teamGen;
     let d;
     try { d = await teamCall({ aktion: "liste" }); } catch (e) { if (gen === teamGen) teamFail(e); return; }
     if (gen !== teamGen || !teamDlg.open || isLocked()) return;
-    const ich = d.ich;
-    $("people").replaceChildren(...(d.personen.length ? d.personen.map(p => {
-      const self = !!ich && p.email === ich, st = (STATUS[p.status] || STATUS.gesperrt)(p);
-      // Der Team-Zugang richtet nur ein: Personen mit eigenem Passwort ändert nur, wer selbst verwalten darf
-      const locked = d.team && p.eingerichtet;
-      return el("li", null,
-        el("span", { class: "pn" }, p.name + (p.admin ? " · verwaltet" : "") + (self ? " (du)" : "")),
-        el("span", { class: "ps", "data-s": p.status }, st),
-        self ? null : locked ? el("span", { class: "pa note" }, "Ändern nur mit eigenem Verwalter-Zugang") : el("span", { class: "pa" },
-          el("button", { class: "btn", type: "button", onclick: (ev) => {
-            const go = () => teamAct({ aktion: "neuer_code", person: p.id }, (r) => showCode(p.name, r.code, r.bis));
-            if (p.status === "aktiv") confirmClick(ev.currentTarget, "Altes Passwort sperren?", go); else go();
-          } }, "Neuer Code"),
-          p.status === "gesperrt" ? null : el("button", { class: "btn", type: "button",
-            onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich sperren?", () => teamAct({ aktion: "sperren", person: p.id }, () => toast(`${p.name} ist gesperrt`))) }, "Sperren"),
-          el("button", { class: "btn", type: "button", onclick: () => teamAct({ aktion: "admin_setzen", person: p.id, admin: !p.admin }) }, p.admin ? "Verwalten aus" : "Verwalten an"),
-          el("button", { class: "btn danger", type: "button",
-            onclick: (ev) => confirmClick(ev.currentTarget, "Wirklich entfernen?", () => teamAct({ aktion: "entfernen", person: p.id }, () => toast(`${p.name} ist entfernt, die Termine bleiben`))) }, "Entfernen")));
-    }) : [el("li", { class: "empty" }, "Noch niemand angelegt. Lege zuerst dich selbst an und erlaube dir das Verwalten.")]));
-    $("adminTip").hidden = d.verwalter !== 1;
-    offOk = !!ich && !!d.team_aktiv;
-    $("teamOff").hidden = !d.team_aktiv;
-    $("teamOffBtn").disabled = !offOk;
-    $("teamOffHint").textContent = ich ? "Das gemeinsame Team-Passwort funktioniert noch. Wenn alle ihr eigenes haben, schalte es ab. Wer es kennt, kommt danach nicht mehr hinein."
-      : "Das gemeinsame Team-Passwort funktioniert noch. Abschalten kann es nur, wer mit dem eigenen Namen angemeldet ist und verwalten darf.";
+    teamData = d;
+    drawTeam();
   }
   $("teamBtn").addEventListener("click", () => {
     $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
+    $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null;
     disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
     teamDlg.showModal(); loadTeam();
   });
   $("teamClose").addEventListener("click", () => teamDlg.close());
   // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
   teamDlg.addEventListener("close", () => {
-    teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn"));
+    teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn")); teamData = null;
+    if (logDlg.open) logDlg.close();
   });
+
+  // ---------- Änderungsprotokoll (nur Verwalter mit eigenem Zugang) ----------
+  const logDlg = $("logDlg");
+  const FELD = { title: "Titel", date: "Datum", all_day: "Ganztägig", start_time: "Beginn", end_time: "Ende", person: "Eingetragen von", note: "Notiz", cat: "Art" };
+  const dmy = (s) => /^\d{4}-\d\d-\d\d$/.test(s || "") ? `${s.slice(8, 10)}.${s.slice(5, 7)}.${s.slice(0, 4)}` : (s || "");
+  const wert = (k, v) => v == null || v === "" ? "–" : k === "date" ? dmy(v) : k === "all_day" ? (v ? "ja" : "nein") : k === "cat" ? catLabel(v) : String(v);
+  // Ein Eintrag als Text: Zeit, wer, was. Bei Änderungen die Felder vorher → nachher, beim Anlegen und Löschen der ganze Termin
+  // (damit sich ein gelöschter Termin mit Uhrzeit und Notiz wieder eintragen lässt)
+  function logText(x) {
+    if (x.art !== "termin") return { was: "Zugang" + (x.person ? ` ${x.person}` : "") + `: ${x.aktion}`, details: [] };
+    const t = x.nachher || x.vorher || {};
+    const was = `Termin „${t.title || "–"}“ am ${dmy(t.date)} ${x.aktion}`;
+    if (x.aktion === "geändert") {
+      return { was, details: Object.keys(FELD).filter(k => JSON.stringify(x.vorher?.[k] ?? null) !== JSON.stringify(x.nachher?.[k] ?? null))
+        .map(k => `${FELD[k]}: ${wert(k, x.vorher?.[k])} → ${wert(k, x.nachher?.[k])}`) };
+    }
+    const zeit = t.all_day ? "ganztägig" : `${t.start_time || "–"} bis ${t.end_time || "–"} Uhr`;
+    return { was, details: [`Zeit: ${zeit}`, `${FELD.cat}: ${wert("cat", t.cat)}`, `${FELD.person}: ${wert("person", t.person)}`]
+      .concat(t.note ? [`${FELD.note}: ${t.note}`] : []) };
+  }
+  let logGen = 0, logLast = null, logBusy = false;
+  async function logPage(vor, anzahl) {
+    let r;
+    try { r = await within(sb.rpc("kalender_protokoll", { p_vor_am: vor ? vor.am : null, p_vor_k: vor ? vor.k : null, p_anzahl: anzahl }), 20000); }
+    catch { throw { status: 0 }; }
+    if (r.error) throw loggedOut(r.error) ? { status: 401 } : { status: 0 };
+    if (!Array.isArray(r.data)) throw { status: 403 };
+    return r.data;
+  }
+  function logFail(e) {
+    if (e && e.status === 401) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return; }
+    $("logErr").textContent = e && e.status === 403 ? "Das Protokoll sehen nur Verwalter mit eigenem Zugang." : "Das Protokoll konnte nicht geladen werden. Prüfe die Verbindung.";
+  }
+  async function loadLog(more) {
+    if (logBusy) return;
+    const gen = logGen;
+    logBusy = true; $("logErr").textContent = ""; $("logMore").disabled = true;
+    try {
+      const rows = await logPage(more ? logLast : null, 100);
+      if (gen !== logGen || !logDlg.open) return;
+      if (!more) $("logList").replaceChildren();
+      for (const x of rows) {
+        const { was, details } = logText(x);
+        $("logList").append(el("li", null, el("span", { class: "lt num" }, fmtStamp(x.am)), el("span", { class: "lw" }, x.wer),
+          el("span", { class: "la" }, was), ...details.map(d => el("span", { class: "ld" }, d))));
+      }
+      if (!more && !rows.length) $("logList").append(el("li", { class: "empty" }, "Noch keine Einträge."));
+      logLast = rows.length ? rows[rows.length - 1] : logLast;
+      $("logMore").hidden = rows.length < 100;
+    } catch (e) { if (gen === logGen) logFail(e); }
+    finally { logBusy = false; $("logMore").disabled = false; }
+  }
+  // Als Tabelle (CSV, öffnet in Excel): alle Einträge, neueste zuerst
+  const zelle = (v) => { let s = String(v ?? ""); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  async function saveLog() {
+    if (logBusy) return;
+    const gen = logGen;
+    logBusy = true; $("logCsv").disabled = true; $("logErr").textContent = "";
+    try {
+      const all = [];
+      for (let vor = null; ;) {
+        const rows = await logPage(vor, 500);
+        if (gen !== logGen || !logDlg.open) return;
+        all.push(...rows);
+        if (rows.length < 500) break;
+        vor = rows[rows.length - 1];
+      }
+      const lines = [["Zeit", "Wer", "Was", "Änderungen"].map(zelle).join(";")];
+      for (const x of all) { const { was, details } = logText(x); lines.push([fmtWhen(x.am), x.wer, was, details.join(" | ")].map(zelle).join(";")); }
+      const now = new Date();
+      const url = URL.createObjectURL(new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" }));
+      const a = el("a", { href: url, download: `Teamkalender_Protokoll_${ymd(now)}.csv` });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast("Protokoll wird gespeichert. Vertraulich, enthält Kundendaten.");
+    } catch (e) { if (gen === logGen) logFail(e); }
+    finally { logBusy = false; $("logCsv").disabled = false; }
+  }
+  $("logBtn").addEventListener("click", () => {
+    logGen++; logLast = null; $("logList").replaceChildren(); $("logErr").textContent = ""; $("logMore").hidden = true;
+    logDlg.showModal(); loadLog(false);
+  });
+  $("logMore").addEventListener("click", () => loadLog(true));
+  $("logCsv").addEventListener("click", saveLog);
+  $("logClose").addEventListener("click", () => logDlg.close());
+  // Kundendaten nur so lange auf dem Bildschirm, wie das Fenster offen ist
+  logDlg.addEventListener("close", () => { logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; });
   $("addForm").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const name = $("addName").value.replace(/\s+/g, " ").trim(), admin = $("addAdmin").checked;

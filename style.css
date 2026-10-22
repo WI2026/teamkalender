@@ -444,7 +444,7 @@ body.locked .app { display: none; }
 .people li { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; align-items: center; padding: 10px 12px;
   border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
 .people .pn { font-weight: 650; min-width: 0; overflow-wrap: anywhere; }
-.people .ps { grid-column: 1; font-size: 12px; color: var(--fg-2); white-space: nowrap; }
+.people .ps { grid-column: 1; min-width: 0; font-size: 12px; color: var(--fg-2); overflow-wrap: anywhere; }
 .people .ps[data-s="aktiv"]::before, .people .ps[data-s="code"]::before, .people .ps[data-s="abgelaufen"]::before, .people .ps[data-s="gesperrt"]::before {
   content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
 .people .ps[data-s="aktiv"]::before { background: var(--cat-abwesend); }
@@ -461,6 +461,23 @@ body.locked .app { display: none; }
   background: var(--accent-soft); color: var(--fg); font-size: 13px; }
 .codebox .code { font-size: 28px; font-weight: 700; letter-spacing: .12em; user-select: all; }
 .teamoff { display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.people .ps[data-s="neu"]::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px;
+  border: 1.5px solid var(--fg-3); box-sizing: border-box; }
+.people .ren { display: contents; }
+.people .ren input { grid-column: 1; min-width: 0; height: 36px; }
+.people .ren .note { grid-column: 1 / -1; white-space: normal; color: var(--fg-3); }
+.steps { margin: 0; padding: 12px 12px 12px 30px; border-radius: 12px; background: var(--accent-soft); display: grid; gap: 4px; }
+.logrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.logrow .hint { flex: 1 1 260px; }
+#logDlg { width: min(680px, calc(100vw - 32px)); }
+.log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 58dvh; overflow: auto; }
+.log li { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; padding: 8px 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--bg); font-size: 13px; }
+.log .lt { color: var(--fg-2); white-space: nowrap; }
+.log .lw { font-weight: 650; overflow-wrap: anywhere; }
+.log .la, .log .ld { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.log .ld { color: var(--fg-2); font-size: 12px; white-space: pre-wrap; }
+.log .empty { grid-template-columns: 1fr; color: var(--fg-2); }
 .teamoff .btn { justify-self: start; }
 @media (max-width: 480px) { .people li { grid-template-columns: 1fr; } .people .pa { grid-column: 1; grid-row: auto; justify-content: flex-start; } }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

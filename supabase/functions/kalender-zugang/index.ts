@@ -28,19 +28,38 @@ function kopf(req: Request): Record<string, string> {
   };
 }
 
-// Mindestens 10 Zeichen, höchstens 72 Bytes (Grenze des Verfahrens), nicht nur Name, Firma oder ein bekanntes Wort mit Zahlen
+// Mindestens 10 Zeichen, höchstens 72 Bytes (Grenze des Verfahrens). Ohne Name (auch Teile davon), Firma und bekannte Wörter
+// muss mehr übrig bleiben als ein paar Zeichen oder nur Zahlen.
 function passwortFehler(pw: string, name: string): string {
   if (pw.length < 10) return "passwort_kurz";
   if (new TextEncoder().encode(pw).length > 72) return "passwort_lang";
   if (/^(.)\1+$/u.test(pw)) return "passwort_schwach";
-  const k = pw.toLowerCase().replace(/[^a-z0-9äöüß]/g, "");
-  const nurZahlen = (s: string) => /^\d*$/.test(s);
-  const n = name.toLowerCase().replace(/[^a-z0-9äöüß]/g, "");
-  for (const w of n.length >= 3 ? [...HAEUFIG, n] : HAEUFIG) {
-    const i = k.indexOf(w);
-    if (i >= 0 && nurZahlen(k.slice(0, i)) && nurZahlen(k.slice(i + w.length))) return "passwort_schwach";
+  // Zwei Schreibweisen ohne Akzente: „Hüseyin“ als „huseyin“ und „hueseyin“, „Weiß“ als „weiss“ (auch „ş“, „ç“, „ı“ usw.)
+  const falten = (s: string, umlaut: boolean) => {
+    let t = s.normalize("NFC").toLowerCase().replace(/ß/g, "ss").replace(/ı/g, "i");
+    if (umlaut) t = t.replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue");
+    return t.normalize("NFKD").replace(/\p{M}/gu, "").replace(/[^\p{L}\p{N}]/gu, "");
+  };
+  const woerter = (umlaut: boolean) => [falten(name, umlaut), ...name.split(/[^\p{L}\p{N}]+/u).map((w) => falten(w, umlaut))];
+  const weg = [...new Set([...HAEUFIG.map((w) => falten(w, false)), ...HAEUFIG.map((w) => falten(w, true)), ...woerter(false), ...woerter(true)])]
+    .filter((w) => w.length >= 3).sort((a, b) => b.length - a.length);
+  for (const umlaut of [false, true]) {
+    let rest = falten(pw, umlaut);
+    for (const w of weg) rest = rest.split(w).join("");
+    if (/^\d*$/.test(rest) || [...rest].length < 4) return "passwort_schwach";
   }
   return "";
+}
+
+// Absender für die Drossel beim Einrichten: die Adresse, die Cloudflare vor Supabase selbst einträgt (kann der Aufrufer nicht setzen),
+// sonst der erste Eintrag in x-forwarded-for. IPv6 zählt je /64, weil ein Anschluss meist ein ganzes /64 hat.
+function absenderAus(h: Headers): string {
+  const roh = (h.get("cf-connecting-ip") || (h.get("x-forwarded-for") || "").split(",")[0] || "").trim().toLowerCase().slice(0, 64);
+  if (!roh.includes(":")) return roh;
+  const [vorne, hinten = ""] = roh.split("%")[0].split("::");
+  const a = vorne ? vorne.split(":") : [], z = hinten ? hinten.split(":") : [];
+  const voll = roh.includes("::") ? [...a, ...Array(Math.max(0, 8 - a.length - z.length)).fill("0"), ...z] : a;
+  return voll.slice(0, 4).map((x) => (parseInt(x || "0", 16) || 0).toString(16)).join(":") + "::/64";
 }
 
 async function rpc<T>(fn: string, args: Record<string, unknown>): Promise<T> {
@@ -65,9 +84,11 @@ Deno.serve(async (req) => {
     // ---------- erstes Passwort oder neues Passwort mit Einmal-Code ----------
     if (aktion === "einrichten") {
       const code = String(b.code || "").toUpperCase().replace(/[^0-9A-Z]/g, ""), pw = String(b.passwort ?? "");
-      if (code.length !== 8) return antwort(400, { fehler: "eingabe" });
+      if (code.length !== 10) return antwort(400, { fehler: "eingabe" });
+      // Absender für die Drossel je Absender (die Datenbank speichert davon nur einen Hash)
+      const absender = absenderAus(req.headers);
       const chk = await rpc<{ ok: boolean; fehler?: string; person?: string; email?: string; name?: string; user_id?: string | null }>(
-        "kalender_z_code_pruefen", { p_code: code });
+        "kalender_z_code_pruefen", { p_code: code, p_absender: absender });
       if (!chk || !chk.ok) return antwort(chk?.fehler === "zu_viele" ? 429 : 403, { fehler: chk?.fehler || "falsch" });
       const pf = passwortFehler(pw, chk.name || "");
       if (pf) return antwort(400, { fehler: pf });
@@ -114,18 +135,25 @@ Deno.serve(async (req) => {
       const stoerung = ue.name === "AuthRetryableFetchError" || ue.name === "AuthUnknownError" || st === 0 || st === 429 || st >= 500;
       return stoerung ? antwort(503, { fehler: "server" }) : antwort(401, { fehler: "anmeldung" });
     }
-    const email = (ud?.user?.email || "").toLowerCase();
-    if (!email) return antwort(401, { fehler: "anmeldung" });
-    if (!(await rpc<boolean>("kalender_z_admin", { p_email: email }))) return antwort(403, { fehler: "keine_rechte" });
+    const email = (ud?.user?.email || "").toLowerCase(), kontoId = ud?.user?.id || "";
+    if (!email || !UUID.test(kontoId)) return antwort(401, { fehler: "anmeldung" });
+    // Verwalter ist genau dieses Konto, nicht irgendein Konto mit derselben Adresse
+    if (!(await rpc<boolean>("kalender_z_admin", { p_email: email, p_user: kontoId }))) return antwort(403, { fehler: "keine_rechte" });
     const team = email === TEAM, ich = team ? null : email;
     type Person = { id: string; email: string; eingerichtet: boolean };
     const liste = () => rpc<{ personen: Person[]; team_aktiv: boolean; verwalter: number }>("kalender_z_liste", {});
 
     if (aktion === "liste") return antwort(200, { ...(await liste()), ich, team });
 
+    // Keine unsichtbaren Zeichen (sonst zwei gleich aussehende Namen) und keine Namen, die im Protokoll für die Datenbank selbst stehen
+    const nameAus = (v: unknown) => {
+      const n = String(v || "").normalize("NFC").replace(/\s+/g, " ").trim();
+      return !n || n.length > 40 || /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u.test(n) || /^team/i.test(n)
+        || /^(datenbank|system|einrichtung|notfall)$/i.test(n) ? "" : n;
+    };
     if (aktion === "anlegen") {
-      const name = String(b.name || "").replace(/\s+/g, " ").trim();
-      if (!name || name.length > 40 || /[\u0000-\u001f\u007f-\u009f]/.test(name) || /^team/i.test(name)) return antwort(400, { fehler: "name" });
+      const name = nameAus(b.name);
+      if (!name) return antwort(400, { fehler: "name" });
       try { return antwort(200, await rpc("kalender_z_anlegen", { p_name: name, p_admin: !!b.admin, p_wer: email })); }
       catch (e) { if (fehlerCode(e) === "23505") return antwort(409, { fehler: "name_vergeben" }); throw e; }
     }
@@ -135,15 +163,24 @@ Deno.serve(async (req) => {
       return (await rpc<boolean>("kalender_z_team_aus", { p_wer: email })) ? antwort(200, { ok: true }) : antwort(409, { fehler: "kein_verwalter" });
     }
 
-    if (!["neuer_code", "sperren", "entfernen", "admin_setzen"].includes(aktion)) return antwort(400, { fehler: "aktion" });
+    if (!["neuer_code", "sperren", "entfernen", "admin_setzen", "umbenennen"].includes(aktion)) return antwort(400, { fehler: "aktion" });
     const person = String(b.person || "").toLowerCase();
     if (!UUID.test(person)) return antwort(400, { fehler: "eingabe" });
     const p = (await liste()).personen.find((x) => x.id === person);
     if (!p) return antwort(404, { fehler: "unbekannt" });
+    // Das Team-Konto richtet nur ein: an Personen mit eigenem Passwort ändert es nichts. Einzige Ausnahme: das Verwalter-Recht geben
+    // (z. B. wenn sich der Inhaber ohne Häkchen eingerichtet hat). Damit endet die Team-Phase sofort.
+    if (team && p.eingerichtet && !(aktion === "admin_setzen" && b.admin === true)) return antwort(403, { fehler: "team_nicht" });
+    if (aktion === "umbenennen") {
+      const name = nameAus(b.name);
+      if (!name) return antwort(400, { fehler: "name" });
+      try {
+        return (await rpc<boolean>("kalender_z_umbenennen", { p_person: person, p_name: name, p_wer: email }))
+          ? antwort(200, { ok: true }) : antwort(404, { fehler: "unbekannt" });
+      } catch (e) { if (fehlerCode(e) === "23505") return antwort(409, { fehler: "name_vergeben" }); throw e; }
+    }
     // Sich selbst aussperren oder das eigene Verwalter-Recht nehmen geht nicht
     if (p.email === ich) return antwort(400, { fehler: "selbst" });
-    // Das Team-Konto richtet nur ein: an Personen mit eigenem Passwort ändert es nichts
-    if (team && p.eingerichtet) return antwort(403, { fehler: "team_nicht" });
 
     // Anmeldekonto sperren, damit das alte Passwort sofort nichts mehr nützt (Fehler nur protokollieren: der Zugang ist schon entzogen)
     const sperre = async (uid: string | null | undefined) => {
@@ -167,14 +204,18 @@ Deno.serve(async (req) => {
       return (await rpc<boolean>("kalender_z_admin_setzen", { p_person: person, p_admin: !!b.admin, p_wer: email }))
         ? antwort(200, { ok: true }) : antwort(404, { fehler: "unbekannt" });
     }
-    // entfernen: zuerst das Anmeldekonto löschen, dann die Person; so bleibt kein Konto mit bekanntem Passwort zurück
-    const uid = await rpc<string | null>("kalender_z_konto", { p_person: person });
-    if (uid) {
-      const r = await db.auth.admin.deleteUser(uid);
+    // entfernen: erst den Zugang entziehen (Sitzungen enden, Code weg), dann das Anmeldekonto löschen, zuletzt die Person.
+    // Bricht es mittendrin ab, bleibt höchstens eine gesperrte Person übrig, nie ein freigeschalteter Zugang ohne Konto.
+    const gesperrt = await rpc<{ user_id: string | null } | null>("kalender_z_sperren", { p_person: person, p_wer: email });
+    if (!gesperrt) return antwort(404, { fehler: "unbekannt" });
+    if (gesperrt.user_id) {
+      const r = await db.auth.admin.deleteUser(gesperrt.user_id);
       if (r.error && fehlerCode(r.error) !== "user_not_found") throw r.error;
     }
     return (await rpc<boolean>("kalender_z_entfernen", { p_person: person, p_wer: email })) ? antwort(200, { ok: true }) : antwort(404, { fehler: "unbekannt" });
   } catch (e) {
+    // Team-Phase ist zwischen Prüfung und Aktion zu Ende gegangen
+    if (fehlerCode(e) === "42501") return antwort(403, { fehler: "keine_rechte" });
     console.error(aktion, fehlerCode(e), (e as { message?: string } | null)?.message || "");
     return antwort(500, { fehler: "server" });
   }
