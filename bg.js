@@ -67,7 +67,7 @@
     last = now; draw(false);
   }
   // Kalender offen auf dem Handy: die Karten verdecken das Bild fast ganz, dann steht es still und spart Akku
-  const covered = () => !document.body.classList.contains("locked") && innerWidth < 700;
+  const covered = () => !document.body.classList.contains("locked") && innerWidth <= 960;   // einspaltiger Kalender
   let coveredNow = false;
   function start() {
     cancelAnimationFrame(raf); clearInterval(tick);
@@ -80,7 +80,8 @@
     raf = requestAnimationFrame(loop);
   }
   const redraw = () => draw(reduce.matches);
-  function resize() { if (!scene || lost) return; try { scene.resize(state(0, true)); } catch (e) { fail(e); return; } redraw(); } // sofort zeichnen, sonst blitzt eine leere Fläche auf
+  // sofort zeichnen, sonst blitzt eine leere Fläche auf (außer start() folgt ohnehin gleich und zeichnet)
+  function resize(noDraw) { if (!scene || lost) return; try { scene.resize(state(0, true)); } catch (e) { fail(e); return; } if (!noDraw) redraw(); }
 
   c3.addEventListener("webglcontextlost", (e) => {
     if (c3.style.display === "none") return;   // die Szene zeichnet gerade ohne WebGL (Standbild), das betrifft sie nicht
@@ -91,10 +92,13 @@
   });
   c3.addEventListener("webglcontextrestored", () => setTimeout(() => {
     if (!lost) return;
+    const g = c3.getContext("webgl") || c3.getContext("experimental-webgl");
+    if (!g || g.isContextLost()) return;   // schon wieder verloren: auf das nächste „restored“ warten
     make(); lost = !scene;
     if (scene) { resize(); start(); }
   }, 0));
-  addEventListener("resize", () => { resize(); if (covered() !== coveredNow) start(); });
+  c2.addEventListener("contextrestored", () => redraw());   // Standbild ohne WebGL nach einem Grafikabsturz neu zeichnen
+  addEventListener("resize", () => { const c = covered() !== coveredNow; resize(c); if (c) start(); });
   new MutationObserver(() => { if (covered() !== coveredNow) start(); }).observe(document.body, { attributes: true, attributeFilter: ["class"] });
   document.addEventListener("visibilitychange", start);
   reduce.addEventListener("change", start);

@@ -246,6 +246,7 @@
     const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return null;
     let img = null, key = "";
+    canvas.addEventListener("contextrestored", () => { key = ""; });   // Inhalt nach einem Grafikabsturz weg: neu zeichnen
     return {
       kind: "2d",
       ready: () => !!img,
@@ -275,9 +276,10 @@
     const on = R.kind === "webgl" ? canvas3d : canvas2d, off = R.kind === "webgl" ? canvas2d : canvas3d;
     off.style.display = "none"; on.style.display = "";
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    on.style.opacity = "0";
-    on.style.transition = reduce ? "none" : "opacity 900ms cubic-bezier(0.23, 1, 0.32, 1)";
-    let disposed = false, last = null, want = null, v = null, asp = 16 / 9, scale = 1, tries = 0, retryT = 0, toneT = 0;
+    on.style.transition = "none"; on.style.opacity = "0";   // ohne Übergang, sonst blendet die leere Leinwand erst aus
+    let disposed = false, last = null, want = null, v = null, asp = 16 / 9, scale = 1, tries = 0, retryT = 0, toneT = 0, failed = false;
+    let chosen = null, pickW = 0;
+    const coarse = matchMedia("(pointer: coarse)");
     // Dunkles Foto (Abendszene): Kopfzeile und Werkzeugleiste stehen direkt darauf und werden hell (style.css,
     // data-bg-ton), der Schleier bleibt Navy und die Browserleiste färbt sich passend. Erst wenn das Foto da ist.
     const night = cfg.tone === "dunkel", root = document.documentElement;
@@ -287,37 +289,71 @@
       if (onOff) root.setAttribute("data-bg-ton", "dunkel"); else root.removeAttribute("data-bg-ton");
       metas.forEach((m, i) => { m.content = onOff ? NAVY : metaWas[i]; });
     }
+    // Helle Karten deckender, sobald das dunkle Foto sichtbar wird (style.css, data-bg-foto), sonst wirken sie grau
+    function photo(onOff) {
+      if (!night) return;
+      if (onOff) root.setAttribute("data-bg-foto", "dunkel"); else root.removeAttribute("data-bg-foto");
+    }
     // Beim Drucken fehlt das Foto (style.css), die Kopfzeile braucht dann wieder ihre normalen Farben
-    const beforePrint = () => tone(false), afterPrint = () => { if (!disposed && v) tone(true); };
+    const beforePrint = () => { tone(false); photo(false); }, afterPrint = () => { if (!disposed && v) { tone(true); photo(true); } };
     addEventListener("beforeprint", beforePrint); addEventListener("afterprint", afterPrint);
     // Hochformat-Foto, wenn es eins gibt und der Bildschirm hoch ist (Handy); sonst das Querformat. Zwischen den
-    // Schwellen bleibt das aktuelle Foto, damit eine Tastatur, die nur die Höhe verkleinert, nicht das Foto tauscht.
+    // Schwellen bleibt das gewählte Foto, und auf Touch-Geräten ändert nur eine neue Breite die Wahl: die Tastatur
+    // oder die Leisten des Browsers verkleinern bloß die Höhe und sollen das Foto nicht tauschen.
     const variantFor = (w, h) => {
       if (!cfg.tall) return cfg.wide;
-      const r = w / h, now = want || v;
-      return now === cfg.tall ? (r < 1 ? cfg.tall : cfg.wide) : (isPhoneLike(w, h) ? cfg.tall : cfg.wide);
+      if (chosen && w === pickW && coarse.matches) return chosen;
+      return chosen === cfg.tall ? (w / h < 1 ? cfg.tall : cfg.wide) : (isPhoneLike(w, h) ? cfg.tall : cfg.wide);
     };
-    function pick(w, h) {
-      const nv = variantFor(w, h);
-      if (nv === want) return; want = nv; clearTimeout(retryT);
-      Promise.all([loadImage(nv.img), nv.mask ? loadImage(nv.mask) : Promise.resolve(null)]).then(([im, mk]) => {
-        if (disposed || want !== nv || !R.setImages(nv, im, mk)) return;
-        tries = 0; v = nv; asp = im.naturalWidth / im.naturalHeight;
-        if (last) draw(last);
-        // Helle Kopfzeile erst, wenn das Foto halb eingeblendet ist; vorher stünde helle Schrift auf hellem Verlauf
-        requestAnimationFrame(() => { on.style.opacity = "1"; clearTimeout(toneT); toneT = setTimeout(() => { if (!disposed) tone(true); }, reduce ? 0 : 120); });
-      }).catch(() => {
-        // Ohne Foto bleibt der Farbverlauf der Seite stehen. Später noch einmal versuchen, etwa nach einem Funkloch.
-        if (disposed || want !== nv) return;
-        want = null;
-        if (tries < 3) retryT = setTimeout(() => { if (!disposed && last) pick(last.w, last.h); }, [8000, 30000, 120000][tries++]);
+    function reveal() {
+      const locked = document.body.classList.contains("locked");
+      clearTimeout(toneT);
+      if (reduce || !locked || on.style.opacity === "1") {
+        // Kalender offen (meist Foto aus dem Zwischenspeicher): sofort zeigen, Kopfzeile im selben Bild umschalten
+        on.style.transition = "none"; on.style.opacity = "1"; photo(true); tone(true);
+        return;
+      }
+      // Anmeldung: sanft einblenden; die helle Kopfzeile erst, wenn das Foto halb da ist, sonst stünde helle Schrift auf hellem Verlauf
+      on.style.transition = "opacity 900ms cubic-bezier(0.23, 1, 0.32, 1)";
+      requestAnimationFrame(() => {
+        if (disposed) return;
+        on.style.opacity = "1"; photo(true);
+        toneT = setTimeout(() => { if (!disposed) tone(true); }, 120);
       });
     }
+    function pick(w, h) {
+      const nv = variantFor(w, h); pickW = w; chosen = nv;
+      if (nv === want) return;   // lädt schon, ist schon da oder wartet auf den nächsten Versuch
+      want = nv; clearTimeout(retryT);
+      if (nv === v) return;      // zurück zum Foto, das schon gezeigt wird
+      Promise.all([loadImage(nv.img), nv.mask ? loadImage(nv.mask) : Promise.resolve(null)]).then(([im, mk]) => {
+        if (disposed || want !== nv || !R.setImages(nv, im, mk)) return;
+        tries = 0; failed = false; v = nv; asp = im.naturalWidth / im.naturalHeight;
+        if (last) draw(last);
+        reveal();
+      }).catch(() => {
+        // Ohne Foto bleibt der Farbverlauf der Seite stehen. Später noch einmal versuchen, etwa nach einem Funkloch;
+        // bis dahin löst ein Größenwechsel keinen neuen Abruf aus (want bleibt stehen).
+        if (disposed || want !== nv) return;
+        failed = true;
+        if (tries < 3) retryT = setTimeout(() => { if (!disposed && last && want === nv) { want = null; pick(last.w, last.h); } }, [8000, 30000, 120000][tries++]);
+      });
+    }
+    // Wieder Netz: gleich noch einmal versuchen statt auf den nächsten Termin zu warten
+    const online = () => { if (!disposed && failed && last) { failed = false; clearTimeout(retryT); want = null; pick(last.w, last.h); } };
+    addEventListener("online", online);
     function layout(st) {
       const w = Math.max(1, st.w), h = Math.max(1, st.h), dpr = Math.min(window.devicePixelRatio || 1, 3);
       const ph = cfg.tall ? v === cfg.tall : isPhoneLike(w, h);
-      const sh = ph && v.short && h < v.short.below ? v.short : null;   // niedriges Handyfenster, etwa Safari mit Leisten
-      const crop = cropFor(w, h, asp, (sh && sh.focus) || (ph && v.focusPhone) || v.focus || [0.5, 0.5], sh ? sh.zoom : ph ? v.zoomPhone : v.zoom);
+      let focus = (ph && v.focusPhone) || v.focus || [0.5, 0.5], zoom = ph ? v.zoomPhone : v.zoom;
+      if (ph && v.below) {
+        // Gerät mindestens „below“ Pixel unter der Bildschirmmitte, also unter der Anmeldekarte, auch in niedrigen
+        // Fenstern (Safari mit Leisten); dafür so weit zoomen, dass der Ausschnitt oben nicht über das Foto hinausragt
+        const py = clamp(0.5 + v.below / h, focus[3] ?? 0.5, 0.95), svCover = w / h > asp ? asp / (w / h) : 1;
+        focus = [focus[0], focus[1], focus[2] ?? 0.5, py];
+        zoom = Math.max(zoom || 1, (svCover * py) / focus[1]);
+      }
+      const crop = cropFor(w, h, asp, focus, zoom);
       // Nicht feiner zeichnen, als das Foto Pixel hat (höchstens 1,6 Megapixel): spart auf Handys viel Rechenzeit und Akku
       const srcPx = (v.px || 1680 * 944) * crop[2] * crop[3];
       scale = clamp(Math.sqrt(Math.min(1.6e6, Math.max(srcPx * 1.2, w * h * 0.5)) / (w * h)), 0.4, dpr);
@@ -336,8 +372,8 @@
       resize(st) { last = st; pick(st.w, st.h); },   // gezeichnet wird danach mit dem richtigen Zeitpunkt (frame)
       frame(st) { last = st; draw(st); },
       dispose() {
-        disposed = true; clearTimeout(retryT); clearTimeout(toneT); R.dispose(); tone(false);
-        removeEventListener("beforeprint", beforePrint); removeEventListener("afterprint", afterPrint);
+        disposed = true; clearTimeout(retryT); clearTimeout(toneT); R.dispose(); tone(false); photo(false);
+        removeEventListener("beforeprint", beforePrint); removeEventListener("afterprint", afterPrint); removeEventListener("online", online);
         on.style.opacity = ""; on.style.transition = "";
       },
     };
@@ -377,7 +413,7 @@
       // px: echte Bildschärfe des Hochformats (449 × 799, doppelt hochgerechnet); feiner zu zeichnen kostet nur Akku
       img: B + "wallbox-abend-hoch.webp", mask: B + "wallbox-abend-hoch-maske.png", px: 449 * 799 * 2,
       focus: [0.6, 0.754, 0.5, 0.8], zoomPhone: 1.08,   // Wallbox knapp unter der Anmeldekarte
-      short: { below: 760, focus: [0.6, 0.754, 0.5, 0.87], zoom: 1.2 },   // niedrige Handyfenster: Wallbox tiefer
+      below: 257,   // Wallbox mindestens 257 px unter der Bildschirmmitte, also unter der Anmeldekarte
       sky: { dir: [1, 0], amount: 0.012, period: 40 },
       stars: { amount: 0.8, share: 0.03, density: 110, cloudsInB: true },
       ripple: { freq: 160, speed: 1.1, amount: 0.0016 },
