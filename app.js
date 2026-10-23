@@ -198,7 +198,8 @@
     const f = fortschritt(p.id), gleich = (terminTitel || "").trim().toLowerCase() === p.titel.trim().toLowerCase();
     const stand = !f.loaded ? "…" : f.total ? `${f.done} von ${f.total}` : "keine Schritte";
     const weiter = !f.loaded || !f.total ? null : f.next ? "Als Nächstes: " + f.next.titel : "alle erledigt";
-    return el("button", { class: "ppill", type: "button", "aria-label": `Projektfortschritt ${p.titel}: ${stand}${weiter ? ", " + weiter : ""}`, onclick: () => openProg(p.id) },
+    if (!f.loaded) wantSchritte(p.id);
+    return el("button", { class: "ppill", type: "button", "data-pid": p.id, "aria-label": `Projektfortschritt ${p.titel}: ${stand}${weiter ? ", " + weiter : ""}`, onclick: () => openProg(p.id) },
       svgProj(),
       el("span", { class: "pl" }, gleich ? "Projekt" : p.titel),
       el("span", { class: "pc num" }, stand),
@@ -477,8 +478,9 @@
   function syncProgRow() {
     const id = $("f-projekt").value, p = id && state.projekte.get(id), r = $("progRow");
     r.hidden = !p;
-    if (!p) { r.replaceChildren(); return; }
+    if (!p) { r.replaceChildren(); r.removeAttribute("aria-label"); return; }
     const f = fortschritt(p.id);
+    if (!f.loaded) wantSchritte(p.id);
     r.replaceChildren(
       el("span", { class: "pl" }, "Fortschritt", el("span", { class: "num" }, f.loaded && f.total ? ` · ${f.done} von ${f.total}` : "")),
       pbar(f),
@@ -499,7 +501,7 @@
   // Kundendaten nur so lange im Formular halten, wie es offen ist.
   dlg.addEventListener("close", () => {
     $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null;
-    $("f-projekt").replaceChildren(el("option", { value: "" }, "Kein Projekt")); $("progRow").replaceChildren(); $("progRow").hidden = true;
+    $("f-projekt").replaceChildren(el("option", { value: "" }, "Kein Projekt")); $("progRow").replaceChildren(); $("progRow").removeAttribute("aria-label"); $("progRow").hidden = true;
   });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
@@ -596,6 +598,7 @@
   function setTab(t) {
     if (state.tab === t) return;
     state.tab = t; sitzung.set("kal.tab", t);
+    meBald();
     render();
     if (t === "projekte") loadNaechste();
   }
@@ -751,7 +754,7 @@
     if (isLocked()) return;
     if (progDlg.open) {
       if (!state.projekte.has(progId)) { progDlg.close(); toast("Dieses Projekt wurde gerade gelöscht"); }
-      else renderProg();
+      else { if (state.projLoaded && !state.schritteVon.has(progId)) wantSchritte(progId); renderProg(); }
     }
     if (projDlg.open && projEditId && !state.projekte.has(projEditId)) { projDlg.close(); toast("Dieses Projekt wurde gerade gelöscht"); }
     if (dlg.open) fillProjSelect($("f-projekt").value);
@@ -792,7 +795,10 @@
       if (sr.error) throw sr.error;
       const rows = await alleZeilen(PT, PCOLS, q => q, seq);
       if (!rows) return;
-      const open = rows.filter(r => r.status !== "abgeschlossen").map(r => r.id);
+      // Schritte der nicht fertigen Projekte, dazu die schon einmal geladenen (z. B. ein fertiges Projekt im offenen Unterfenster)
+      const ids = new Set(rows.map(r => r.id)), need = new Set(rows.filter(r => r.status !== "abgeschlossen").map(r => r.id));
+      for (const id of state.schritteVon) if (ids.has(id)) need.add(id);
+      const open = [...need];
       for (let i = 0; i < open.length; i += 100) {
         const chunk = open.slice(i, i + 100);
         const part = await alleZeilen(ST, SCOLS, q => q.in("projekt_id", chunk), seq);
@@ -811,6 +817,9 @@
       for (const [id, r] of st) { if (r) applySchritt(r); else state.schritte.delete(id); }
       for (const [id, x] of state.schritte) if (!state.schritteVon.has(x.projekt_id)) state.schritte.delete(id);
       state.projLoaded = true; state.projErr = false; projStand = sr.data; projRetryMs = 5000;
+      // Während der Abfrage live dazugekommene oder wieder geöffnete Projekte: Schritte nachladen
+      const fehlt = [...pt.keys()].filter(id => state.projekte.has(id) && !state.schritteVon.has(id) && state.projekte.get(id).status !== "abgeschlossen");
+      if (fehlt.length) ensureSchritte(fehlt);
       afterProj();
       if (state.tab === "projekte") loadNaechste();
     } catch (e) {
@@ -863,6 +872,13 @@
       need.forEach(id => state.schritteVon.delete(id));
     }
     afterProj();
+  }
+  // Schritte, die eine Anzeige braucht (Projektzeile am Termin, Unterfenster), gesammelt nachladen
+  let wantSet = new Set(), wantT = 0;
+  function wantSchritte(id) {
+    if (!id || !state.projLoaded || state.schritteVon.has(id) || isLocked()) return;
+    wantSet.add(id);
+    if (!wantT) wantT = setTimeout(() => { wantT = 0; const l = [...wantSet]; wantSet.clear(); ensureSchritte(l); }, 0);
   }
   // Nächster Termin je Projekt (ab heute), für die Übersicht
   let naechsteSeq = 0, naechsteT = null;
@@ -930,7 +946,7 @@
     const f = fortschritt(p.id), nx = state.naechste.get(p.id);
     const meta = [artLabel(p.art), p.auftragsnr ? "Nr. " + p.auftragsnr : null, p.verantwortlich].filter(Boolean).join(" · ");
     const lange = f.seit != null && f.seit >= 14 && p.status === "laufend";
-    return el("button", { class: "prow", type: "button", "data-status": p.status, onclick: () => openProg(p.id) },
+    return el("button", { class: "prow", type: "button", "data-status": p.status, "data-pid": p.id, onclick: () => openProg(p.id) },
       el("span", { class: "pt" }, el("span", { class: "ptn" }, p.titel), p.status === "laufend" ? null : el("span", { class: "badge", "data-status": p.status }, STAND[p.status])),
       el("span", { class: "pm" }, meta),
       el("span", { class: "pnext" + (lange ? " lange" : "") },
@@ -949,6 +965,7 @@
   const stepBusy = new Set();
   function openProg(id) {
     if (!state.projekte.has(id)) return;
+    meBald();
     progId = id; progGen++; progFromEditor = dlg.open; progTermine = null; progEdit = false; progAlle = false;
     $("progBody").replaceChildren(
       el("header", { class: "phead", id: "progHead" }),
@@ -986,12 +1003,26 @@
     return (Number(list[k - 1].pos) + Number(list[k].pos)) / 2;
   }
   // Wieder öffnen braucht einen zweiten Tipp: sonst ginge mit einem Fehltipp verloren, wer den Schritt wann erledigt hat
-  let reopenId = null, reopenT = null;
+  let reopenId = null, reopenT = null, reopenAb = 0;
   function armReopen(sid) {
-    reopenId = sid; clearTimeout(reopenT);
+    reopenId = sid; reopenAb = performance.now(); clearTimeout(reopenT);
     reopenT = setTimeout(() => { reopenId = null; if (progDlg.open) renderProg(); }, 4000);
     renderProg();
     $("progSteps").querySelector(`[data-sid="${CSS.escape(sid)}"] .reopen`)?.focus({ preventScroll: true });
+  }
+  // Streichen ebenso mit Rückfrage; die Rückfrage steht im Zustand, damit sie ein Neuzeichnen (Live-Änderung) übersteht
+  let delArmId = null, delArmT = null, delArmAb = 0;
+  function disarmDel() { delArmId = null; clearTimeout(delArmT); }
+  function armDel(sid) {
+    if (delArmId === sid) {
+      // Doppeltipp zählt nicht als Bestätigung
+      if (performance.now() - delArmAb < 500) return;
+      disarmDel(); delStep(sid); return;
+    }
+    delArmId = sid; delArmAb = performance.now(); clearTimeout(delArmT);
+    delArmT = setTimeout(() => { delArmId = null; if (progDlg.open) renderProg(); }, 4000);
+    renderProg();
+    $("progSteps").querySelector(`[data-sid="${CSS.escape(sid)}"] .sdel`)?.focus({ preventScroll: true });
   }
   function renderProg() {
     const p = state.projekte.get(progId);
@@ -1021,24 +1052,30 @@
       const busy = stepBusy.has(x.id), armed = reopenId === x.id && x.erledigt && !ro;
       return el("li", { "data-sid": x.id, class: (x.erledigt ? "done" : "") + (busy ? " busy" : "") },
         el("label", { class: "chk" },
-          el("input", { type: "checkbox", checked: x.erledigt, disabled: ro || busy, "aria-describedby": x.erledigt ? `sm-${x.id}` : null,
+          // Während des Speicherns nicht „disabled“: sonst verlöre die Tastatur bzw. VoiceOver den Fokus
+          el("input", { type: "checkbox", checked: x.erledigt, disabled: ro, "aria-disabled": busy ? "true" : null, "aria-describedby": x.erledigt ? `sm-${x.id}` : null,
             onchange: (ev) => {
+              if (stepBusy.has(x.id)) { ev.target.checked = !ev.target.checked; return; }
               if (ev.target.checked) toggleStep(x.id, true);
               else { ev.target.checked = true; armReopen(x.id); }
             } }),
           el("span", { class: "box", "aria-hidden": "true" }, svgCheck()),
           el("span", { class: "st" }, el("span", { class: "stt" }, x.titel),
             x.erledigt ? el("span", { class: "sm", id: `sm-${x.id}` }, `erledigt ${x.erledigt_am ? fmtTag(x.erledigt_am) : ""}${x.erledigt_von ? " · " + x.erledigt_von : ""}`) : null)),
-        armed ? el("button", { class: "btn small reopen", type: "button", onclick: () => { reopenId = null; clearTimeout(reopenT); toggleStep(x.id, false); } }, "Wieder öffnen?") : null,
-        edit && !armed && darfStreichen(x) ? el("button", { class: "sdel", type: "button", "aria-label": `Schritt „${x.titel}“ streichen`,
-          onclick: (ev) => confirmClick(ev.currentTarget, "Streichen?", () => delStep(x.id)) }, svgX()) : null);
+        armed ? el("button", { class: "btn small reopen", type: "button", onclick: () => {
+          // Doppeltipp auf den Haken zählt nicht als Bestätigung
+          if (performance.now() - reopenAb < 500) return;
+          reopenId = null; clearTimeout(reopenT); toggleStep(x.id, false); } }, "Wieder öffnen?") : null,
+        edit && !armed && darfStreichen(x) ? (delArmId === x.id
+          ? el("button", { class: "sdel armed", type: "button", "aria-label": `Schritt „${x.titel}“ wirklich streichen?`, onclick: () => armDel(x.id) }, "Streichen?")
+          : el("button", { class: "sdel", type: "button", "aria-label": `Schritt „${x.titel}“ streichen`, onclick: () => armDel(x.id) }, svgX())) : null);
     }));
     $("progAdd").hidden = !edit || !f.loaded;
     $("progAddHint").textContent = neuePos(f.list) != null ? "Neue Schritte kommen vor die Schlussrechnung." : "";
     const note = p.notiz ? [el("span", { class: "k" }, "Notiz"), el("p", null, p.notiz)] : [];
     $("progNote").replaceChildren(...note); $("progNote").hidden = !note.length;
     fill($("progFoot"),
-      ro ? null : el("button", { class: "btn" + (edit ? " on" : ""), type: "button", "aria-pressed": String(edit), onclick: () => { progEdit = !progEdit; renderProg(); if (progEdit) $("progNeu")?.focus({ preventScroll: true }); } },
+      ro ? null : el("button", { class: "btn" + (edit ? " on" : ""), type: "button", "aria-pressed": String(edit), onclick: () => { progEdit = !progEdit; disarmDel(); renderProg(); if (progEdit) $("progNeu")?.focus({ preventScroll: true }); } },
         edit ? "Fertig mit Bearbeiten" : "Schritte bearbeiten"),
       ro || progFromEditor || !offen(p) ? null : el("button", { class: "btn", type: "button", onclick: () => terminFuer(p) }, svgPlus(), "Termin"),
       el("span", { class: "spacer" }),
@@ -1161,6 +1198,8 @@
   }
   async function delStep(sid) {
     $("progErr").textContent = "";
+    // Nach dem Streichen den Fokus auf den nächsten Schritt setzen (sonst landet er bei Tastatur und VoiceOver im Nichts)
+    const list = stepsOf(progId), i = list.findIndex(x => x.id === sid), nb = (list[i + 1] || list[i - 1] || {}).id;
     try {
       const res = await sb.from(ST).delete().eq("id", sid).select("id");
       check(res);
@@ -1174,6 +1213,10 @@
       }
     } catch (e) { const m = stepError(e); if (m && progDlg.open) $("progErr").textContent = m; }
     afterProj();
+    if (progDlg.open && !progDlg.contains(document.activeElement)) {
+      const row = nb && $("progSteps").querySelector(`[data-sid="${CSS.escape(nb)}"]`);
+      (row?.querySelector(".sdel") || row?.querySelector("input") || $("progNeu"))?.focus({ preventScroll: true });
+    }
   }
   // Stand ändern (Als fertig markieren) mit Versionsprüfung
   async function setProjStand(p, status, btn) {
@@ -1195,8 +1238,12 @@
   }
   // Kundendaten nur so lange im Fenster, wie es offen ist
   progDlg.addEventListener("close", () => {
-    progGen++; progId = null; progTermine = null; progEdit = false; reopenId = null;
+    const id = progId;
+    progGen++; progId = null; progTermine = null; progEdit = false; reopenId = null; disarmDel();
     clearTimeout(progTermineT); clearTimeout(reopenT); clearTimeout(progInfoT); $("progBody").replaceChildren();
+    // Das Element, das das Fenster geöffnet hat, wurde inzwischen evtl. neu gezeichnet: Fokus auf seinen Nachfolger
+    if (id && !isLocked() && (!document.activeElement || document.activeElement === document.body))
+      document.querySelector(`.prow[data-pid="${CSS.escape(id)}"], .ppill[data-pid="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
   });
   progDlg.addEventListener("click", (ev) => { if (ev.target === progDlg) progDlg.close(); });
 
@@ -1297,7 +1344,10 @@
           return;
         }
         putProjekt(res.data[0]);
+        // Aus dem Termin angelegt (nach verlorener Antwort hier weitergeführt): Projekt im Termin auswählen
+        const imTermin = projForEditor && dlg.open;
         projDlg.close(); afterProj();
+        if (imTermin) { fillProjSelect(edit); $("f-projekt").focus(); }
         if (progDlg.open) progInfo("Projekt gespeichert."); else toast("Projekt gespeichert");
       } else {
         const id = projNeuId;
@@ -1309,6 +1359,18 @@
         const one = await sb.from(PT).select(PCOLS).eq("id", id).maybeSingle();
         if (isLocked()) return;
         if (one.data) putProjekt(one.data);
+        const d = one.data;
+        if (res.error && d && !(d.titel === titel && d.art === art && d.unterschrieben_am === datum && (d.auftragsnr || "") === nr
+            && (d.verantwortlich || "") === wer && (d.notiz || "") === notiz)) {
+          // Dazwischen wurde etwas geändert: nicht stillschweigend verwerfen, sondern als Bearbeiten weiterführen
+          projEditId = id; projStamp = d.updated_at; projNeuId = null;
+          $("projDlgTitle").textContent = "Projekt bearbeiten"; $("projSave").textContent = "Speichern";
+          $("p-signRow").hidden = true; $("p-vorlage").hidden = true; $("p-statusFeld").hidden = false;
+          $(`pst-${d.status in STAND ? d.status : "laufend"}`).checked = true;
+          $("projDel").hidden = !istVerwalter();
+          $("projErr").textContent = "Das Projekt war beim ersten Versuch schon angelegt. „Speichern“ übernimmt deine Änderungen, die Schritte passt du danach unter „Schritte bearbeiten“ an.";
+          return;
+        }
         const forEditor = projForEditor && dlg.open;
         projDlg.close();
         if (one.data) await ensureSchritte([id]);
@@ -1468,7 +1530,7 @@
     if (progDlg.open) progDlg.close();
     if (projDlg.open) projDlg.close();
     projSeq++; naechsteSeq++; clearTimeout(projRetryT); clearTimeout(naechsteT); stepFailAt = 0;
-    pTouched = new Map(); sTouched = new Map(); stepBusy.clear();
+    pTouched = new Map(); sTouched = new Map(); stepBusy.clear(); wantSet.clear(); clearTimeout(wantT); wantT = 0; disarmDel();
     state.projekte = new Map(); state.schritte = new Map(); state.schritteVon = new Set(); state.naechste = new Map(); state.projLoaded = false; stepIdx = null;
     state.pfilter.q = ""; $("projSearch").value = ""; state.projErr = false;
     $("projList").replaceChildren(); $("projCount").textContent = ""; fehltGeholt.clear();
@@ -1517,6 +1579,10 @@
   // Fragt die Datenbank, ob dieses Konto (noch) Zugang hat und wie die Person heißt. Ohne Verbindung bleibt alles, wie es ist.
   // Antwort: "ok", "weg" (abgemeldet) oder "offen" (keine Antwort).
   let meAt = 0, meSeq = 0, myEmail = "";
+  // Zugang höchstens einmal pro Minute nachfragen. Auch ohne Klicks alle zwei Minuten, solange die Seite sichtbar ist:
+  // ein gesperrtes Gerät, das offen herumliegt, zeigt die Kundendaten sonst weiter an.
+  function meBald() { if (sb && !isLocked() && Date.now() - meAt > 60 * 1000) checkMe(); }
+  setInterval(() => { if (sb && !isLocked() && !document.hidden && Date.now() - meAt > 2 * 60 * 1000) checkMe(); }, 30 * 1000);
   async function checkMe() {
     const seq = ++meSeq;
     let r;
