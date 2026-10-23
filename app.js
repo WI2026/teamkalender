@@ -511,6 +511,8 @@
   // Kundendaten nur so lange im Formular halten, wie es offen ist.
   // Auch beim Abmelden aufgerufen, ob das Fenster offen ist oder nicht (eine späte Antwort könnte es sonst wieder gefüllt haben)
   let dlgGen = 0;
+  // Welches Öffnen afterChange zuletzt wegen Löschung geschlossen hat (die Meldung dazu steht dann schon)
+  let liveZuGen = -1;
   function wipeTermin() {
     $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null;
     $("f-projekt").replaceChildren(el("option", { value: "" }, "Kein Projekt")); $("progRow").replaceChildren(); $("progRow").removeAttribute("aria-label"); $("progRow").hidden = true;
@@ -534,16 +536,19 @@
     // Vor dem Warten merken, welches Öffnen das war: ist inzwischen ein anderer Termin offen, bleibt der unberührt
     const id = editingId, g = dlgGen, sg = sitzGen, name = state.events.get(id)?.title || $("f-title").value.trim() || "Termin";
     const hier = () => g === dlgGen && dlg.open && gleicheSitzung(sg);
-    b.disabled = true; deletingId = id;
+    // Während des Löschens nicht speichern (und umgekehrt beim Speichern nicht löschen)
+    b.disabled = true; $("saveBtn").disabled = true; deletingId = id;
     try {
       await state.col.doc(id).delete();
-      if (hier()) { dlg.close(); toast("Termin gelöscht"); } else if (gleicheSitzung(sg)) toast(`„${kurz(name, 40)}“ gelöscht`);
+      // Auch schließen, wenn derselbe Termin inzwischen erneut geöffnet wurde: den gibt es nicht mehr
+      if (hier() || (dlg.open && editingId === id && gleicheSitzung(sg))) { dlg.close(); toast("Termin gelöscht"); }
+      else if (gleicheSitzung(sg)) toast(`„${kurz(name, 40)}“ gelöscht`);
       render();
     } catch (err) {
       const h = hier(), m = writeError(err, h);
       if (h) $("formErr").textContent = m === STEP_ALLG ? "Löschen hat nicht geklappt. Prüfe die Verbindung und versuche es erneut." : m;
       else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
-    } finally { if (g === dlgGen) b.disabled = false; if (deletingId === id) deletingId = null; }
+    } finally { if (g === dlgGen) { b.disabled = false; $("saveBtn").disabled = false; } if (deletingId === id) deletingId = null; }
   });
 
   $("form").addEventListener("submit", async (ev) => {
@@ -565,8 +570,8 @@
     // Projekt nur mitschicken, wenn es hier geändert wurde (sonst überschriebe ein veralteter Stand die Zuordnung)
     if (!editingId || $("f-projekt").value !== projektAtOpen) body.projektId = $("f-projekt").value || null;
     // Vor dem Warten merken, welches Öffnen das war: eine späte Antwort schließt keinen inzwischen geöffneten anderen Termin
-    const g = dlgGen, sg = sitzGen, hier = () => g === dlgGen && dlg.open && gleicheSitzung(sg);
-    $("saveBtn").disabled = true;
+    const g = dlgGen, sg = sitzGen, id = editingId, hier = () => g === dlgGen && dlg.open && gleicheSitzung(sg);
+    $("saveBtn").disabled = true; $("delBtn").disabled = true;
     try {
       if (editingId) await state.col.doc(editingId).set(body, editingStamp); else await state.col.add(body);
       if (!hier()) {
@@ -583,9 +588,17 @@
       render();
       toast(prev ? "Termin gespeichert" : "Termin eingetragen");
     } catch (e2) {
-      const h = hier(), m = writeError(e2, h);
+      const h = hier();
+      // Termin inzwischen gelöscht: hat afterChange genau dieses Fenster deshalb geschlossen, steht die Meldung schon da.
+      // Noch offen heißt: das eigene Löschen läuft (afterChange lässt das Fenster dann stehen, die Lösch-Antwort schließt es).
+      if (e2 && e2.code === "conflict" && id && !state.events.has(id)) {
+        if (h) $("formErr").textContent = "Dieser Termin wird gerade gelöscht.";
+        else if (liveZuGen !== g && gleicheSitzung(sg)) toast(nichtText(title, "gespeichert", "Er wurde inzwischen gelöscht."), 7000);
+        return;
+      }
+      const m = writeError(e2, h);
       if (h) $("formErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(title, prev ? "gespeichert" : "eingetragen", m), 7000);
-    } finally { if (g === dlgGen) $("saveBtn").disabled = false; }
+    } finally { if (g === dlgGen) { $("saveBtn").disabled = false; $("delBtn").disabled = false; } }
   });
 
   // hier: das Fenster zeigt noch den Termin, für den die Antwort kam. Sonst ändert die Meldung nichts im Formular
@@ -707,7 +720,7 @@
   }
   function dropRow(id) { if (!id) return; touched.add(id); state.events.delete(id); }
   function afterChange() {
-    if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) { dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
+    if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) { liveZuGen = dlgGen; dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
     render();
   }
   state.col = {
@@ -1315,11 +1328,12 @@
       projMeldung(pid, hierText(stepError(e)), nicht, sg);
     } finally { stepBusy.delete(sid); afterProj(); }
   }
-  let addBusy = false;
+  // Sperrt nur das Blatt, in dem gerade hinzugefügt wird (Nummer des Öffnens): ein danach geöffnetes Blatt bleibt bedienbar
+  let addBusy = -1;
   async function addStep() {
     const inp = $("progNeu"), titel = inp.value.replace(/\s+/g, " ").trim(), pid = progId, gen = progGen, sg = sitzGen;
-    if (!titel || addBusy || !state.canWrite) return;
-    addBusy = true; $("progErr").textContent = "";
+    if (!titel || addBusy === gen || !state.canWrite) return;
+    addBusy = gen; $("progErr").textContent = "";
     try {
       const pos = neuePos(stepsOf(pid));
       const res = await sb.from(ST).insert(pos == null ? { projekt_id: pid, titel } : { projekt_id: pid, titel, pos }).select(SCOLS).single();
@@ -1327,7 +1341,7 @@
       putSchritt(res.data);
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
     } catch (e) { projMeldung(gen === progGen ? pid : null, stepError(e), `Der Schritt „${kurz(titel, 40)}“ wurde nicht hinzugefügt. Bitte noch einmal versuchen.`, sg); }
-    finally { addBusy = false; afterProj(); }
+    finally { if (addBusy === gen) addBusy = -1; afterProj(); }
   }
   async function delStep(sid) {
     $("progErr").textContent = "";
@@ -1602,10 +1616,12 @@
   const PDF_COLOR = { baustelle: "#df4505", kunde: "#1f56c2", buero: "#8a8a94", abwesend: "#7fa23a" };
   async function exportPdf() {
     if (!sb || isLocked() || !window.KalPDF) return;
+    // Nur für die Anmeldung, in der geklickt wurde: nach Ab- und neuem Anmelden nichts mehr speichern oder melden
+    const sg = sitzGen;
     state.pdfBusy = true; $("pdfBtn").disabled = true;
     try {
       // Erst prüfen, ob der Zugang noch besteht; sonst entstünde ein leeres PDF, das wie ein leerer Kalender aussieht.
-      if (await checkMe() === "weg") return;
+      if (await checkMe() === "weg" || !gleicheSitzung(sg)) return;
       const now = new Date(), first = new Date(now.getFullYear(), now.getMonth(), 1), got = new Map();
       // Seitenweise nach (Datum, id) weiterlesen: so fehlt kein Termin und keiner kommt doppelt, auch wenn gerade jemand ändert.
       for (let last = null; ;) {
@@ -1617,7 +1633,7 @@
         if (data.length < PAGE) break;
         last = data[data.length - 1];
       }
-      if (isLocked()) return;
+      if (!gleicheSitzung(sg)) return;
       const rows = [...got.values()];
       const who = state.person, whoName = who ? ($("personFilter").selectedOptions[0] || {}).textContent || who : "";
       const byDay = new Map();
@@ -1652,9 +1668,10 @@
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       toast(count ? "PDF wird gespeichert" : whoName ? `PDF gespeichert, ${whoName} hat ab diesem Monat keine Termine` : "PDF gespeichert, ab diesem Monat ist nichts eingetragen");
     } catch (err) {
+      if (!gleicheSitzung(sg)) return;
       if (loggedOut(err)) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
       else toast("PDF ging nicht. Prüfe die Internetverbindung und versuche es erneut.");
-    } finally { state.pdfBusy = false; $("pdfBtn").disabled = !state.canWrite; }
+    } finally { if (sg === sitzGen) { state.pdfBusy = false; $("pdfBtn").disabled = !state.canWrite; } }
   }
   $("pdfBtn").addEventListener("click", exportPdf);
   let channel = null, joined = false, firstT = null, pchannel = null, pjoined = false, pFirstT = null;
@@ -1727,7 +1744,9 @@
     state.pfilter.q = ""; $("projSearch").value = ""; state.projErr = false;
     $("projList").replaceChildren(); $("projCount").textContent = ""; fehltGeholt.clear();
     document.querySelectorAll("#statusSeg .cnt").forEach(n => n.remove());
-    state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = ""; state.me = null;
+    state.events = new Map(); state.ranges = []; state.canWrite = false; state.person = ""; state.me = null; state.pdfBusy = false;
+    // Laufende Zugangsprüfungen gehören zur alten Anmeldung
+    meSeq++;
     // Gezeichnet wird nur der offene Reiter: den verborgenen Kalender ausdrücklich leeren (sonst blieben Termine im Dokument)
     $("board").replaceChildren(); $("agenda").replaceChildren();
     showMe();
@@ -1742,12 +1761,15 @@
     loadNames();
     setTimeout(() => ($("loginName").value ? $("loginPw") : $("loginName")).focus(), 50);
   }
+  // Zählt gelungene Anmeldungen: ein Abmelden, dessen Antwort erst danach scheitert, löscht nicht die neue Sitzung
+  let anmeldOk = 0;
   async function lockOut(msg) {
     loginStamp.set(0);
     showLogin(msg);
+    const nr = anmeldOk;
     let failed = true;
     try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
-    if (failed) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
+    if (failed && nr === anmeldOk) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
   }
   // Nur Kalender-Konten: der Team-Zugang und die persönlichen Zugänge (Adressen ohne Postfach unter kalender.wattcon-installation.de)
   const kalUser = (s) => { const m = (s?.user?.email || "").toLowerCase(); return m === String(CFG.email).toLowerCase() || /^p-[0-9a-f]{12}@kalender\.wattcon-installation\.de$/.test(m); };
@@ -1776,11 +1798,12 @@
   function meBald() { if (sb && !isLocked() && Date.now() - meAt > 60 * 1000) checkMe(); }
   setInterval(() => { if (sb && !isLocked() && !document.hidden && Date.now() - meAt > 2 * 60 * 1000) checkMe(); }, 30 * 1000);
   async function checkMe() {
-    const seq = ++meSeq;
+    const seq = ++meSeq, sg = sitzGen;
     let r;
     try { r = await sb.rpc("kalender_ich"); } catch { return "offen"; }
     if (isLocked()) return "weg";
-    if (seq !== meSeq) return "offen";
+    // Inzwischen ab- und neu angemeldet: die Antwort gilt dem alten Konto
+    if (seq !== meSeq || sg !== sitzGen) return "offen";
     if (r.error) { if (loggedOut(r.error)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return "weg"; } return "offen"; }
     if (!r.data) { accessGone(); return "weg"; }
     meAt = Date.now(); state.me = r.data; showMe();
@@ -1840,7 +1863,10 @@
   $("loginName").addEventListener("change", () => { syncUser(); $("loginErr").textContent = ""; });
   addEventListener("online", () => { if (isLocked()) loadNames(); });
 
+  // Zählt das Wechseln zwischen Anmelden und Einrichten: eine späte Antwort ändert ein neu begonnenes Einrichten nicht
+  let setupNr = 0;
   function showSetup(on) {
+    setupNr++; $("setupBtn").disabled = false;
     $("loginForm").hidden = on; $("setupForm").hidden = !on;
     $("setupErr").textContent = ""; $("loginErr").textContent = "";
     ["setupCode", "setupPw", "setupPw2"].forEach(id => { $(id).value = ""; });
@@ -1853,6 +1879,7 @@
   async function signIn(email, pw) {
     let error = null, data = null;
     try { ({ data, error } = await sb.auth.signInWithPassword({ email, password: pw })); } catch (e) { error = e; }
+    if (data?.session) anmeldOk++;
     if (error) return error;
     if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
     myEmail = data.session.user.email.toLowerCase();
@@ -1906,12 +1933,21 @@
     const err = code.length !== 10 ? "Der Code hat 10 Zeichen, etwa K7MPX-2QXA9."
       : pw.length < 10 ? SETUP_MSG.passwort_kurz : pw !== pw2 ? "Die beiden Passwörter sind nicht gleich." : "";
     if (err) { $("setupErr").textContent = err; return; }
+    const nr = setupNr;
     $("setupBtn").disabled = true; $("setupErr").textContent = "";
     let res = null, out = null;
     try {
       res = await postFn({ aktion: "einrichten", code, passwort: pw });
       out = await res.json().catch(() => null);
     } catch {}
+    if (nr !== setupNr) {
+      // Inzwischen zurück zur Anmeldung oder neu begonnen: nichts überschreiben, nicht selbst anmelden. Nur sagen, dass es geklappt hat.
+      if (res && res.ok && out && out.ok && isLocked() && !$("loginForm").hidden) {
+        if (out.id) store.set("kal.loginName", String(out.id));
+        $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
+      }
+      return;
+    }
     if (!res || !res.ok || !out || !out.ok || !out.email) {
       $("setupBtn").disabled = false;
       $("setupErr").textContent = !res ? "Keine Verbindung. Prüfe das Internet und versuche es erneut."
@@ -1997,9 +2033,12 @@
     }
     catch (e) { if (gen === teamGen) teamFail(e); }
     finally {
-      teamBusy = false;
-      teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; });
-      $("teamOffBtn").disabled = !offOk;
+      // Inzwischen neu geöffnet: Sperre und Knöpfe gehören dem neuen Öffnen
+      if (gen === teamGen) {
+        teamBusy = false;
+        teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; });
+        $("teamOffBtn").disabled = !offOk;
+      }
     }
   }
   function showCode(name, code, bis) {
@@ -2086,6 +2125,8 @@
   $("teamBtn").addEventListener("click", () => {
     $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
     $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null; $("addForm").reset();
+    // Läuft noch eine Aktion des vorigen Öffnens, wird ihre Antwort verworfen: hier gleich wieder bedienbar
+    teamBusy = false; teamDlg.querySelectorAll("button").forEach(b => { b.disabled = false; });
     disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
     teamGen++; oeffne(teamDlg); loadTeam();
   });
