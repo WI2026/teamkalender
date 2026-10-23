@@ -701,7 +701,16 @@
 
   // ---------- Verbindung (Supabase) ----------
   const CFG = window.KALENDER_CONFIG || {};
-  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } }) : null;
+  // Anfragen der Bibliothek an die Anmeldung (Abmelden, Token erneuern) haben sonst keine Zeitgrenze. Solange eine hängt,
+  // hält die Bibliothek ihre Sperre, und eine neue Anmeldung kommt nicht über die Zugangsprüfung hinaus.
+  const AUTH_MS = 15000;
+  const authFetch = (u, o) => {
+    if (o?.signal || !String(u).includes("/auth/v1/")) return fetch(u, o);
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(new DOMException("signal timed out", "TimeoutError")), AUTH_MS);
+    return fetch(u, { ...o, signal: ctl.signal });
+  };
+  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }, global: { fetch: authFetch } }) : null;
   const fromRow = (r) => ({ title: r.title, date: r.date, allDay: !!r.all_day, start: r.start_time || "", end: r.end_time || "",
     person: r.person || "", note: r.note || "", cat: r.cat || "buero", projektId: r.projekt_id || null, createdAt: r.created_at, updatedAt: r.updated_at });
   const toRow = (b) => Object.assign({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
@@ -1828,6 +1837,7 @@
   const kalUser = (s) => { const m = (s?.user?.email || "").toLowerCase(); return m === String(CFG.email).toLowerCase() || /^p-[0-9a-f]{12}@kalender\.wattcon-installation\.de$/.test(m); };
   async function enter() {
     document.body.classList.remove("locked");
+    $("loginPw").value = "";
     showMe();
     startLive();
     // Die erste Ladung kommt mit dem Verbinden der Live-Verbindung; hängt diese, nach 3 s direkt laden.
@@ -1951,8 +1961,9 @@
     loginStamp.set(0);
     if (!isLocked()) showLogin("Anmelden hat nicht geklappt. Bitte noch einmal anmelden.");
   }
-  async function signIn(email, pw) {
-    const nr = ++anmeldNr, aktuell = () => nr === anmeldNr;
+  // gilt: optional, ob der Anlass noch besteht (Einrichten: die Person ist noch im Formular). Sonst wie ein überholter Versuch.
+  async function signIn(email, pw, gilt) {
+    const nr = ++anmeldNr, aktuell = () => nr === anmeldNr && (!gilt || gilt());
     // Erst das vorige Abmelden und noch laufende ältere Versuche zu Ende kommen lassen, damit deren Sitzung nicht die neue
     // überschreibt oder löscht. getSession wartet auf die Sperre der Bibliothek, auch auf ein Abmelden in einem anderen Tab.
     // Hängt die Verbindung, höchstens 10 s; verwerfen und die Prüfungen unten fangen den Rest ab.
@@ -2031,6 +2042,17 @@
     passwort_wie_team: "Bitte nicht das bisherige Team-Passwort nehmen, sondern ein eigenes.",
     eingabe: "Bitte den 10-stelligen Code prüfen.",
   };
+  // Das Einrichten hat geklappt, die Person ist aber inzwischen zurück zur Anmeldung oder hat neu begonnen: nichts überschreiben,
+  // nicht selbst anmelden. Nur sagen, dass es geklappt hat (der Code ist damit verbraucht), und die Namensliste neu laden,
+  // damit der Name zur Auswahl steht.
+  function spaetGespeichert(out) {
+    if (!isLocked()) return;
+    if (out.id) store.set("kal.loginName", String(out.id));
+    // Den eigenen Namen gleich auswählen, außer es wurde schon ein Name gewählt oder ein Passwort (für jemand anderen) eingetippt
+    loadNames(out.id && !$("loginPw").value ? String(out.id) : undefined, true);
+    if (!$("loginForm").hidden) $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
+    else $("setupErr").textContent = "Das zuerst eingegebene Passwort ist gespeichert, der Code ist damit verbraucht. Bitte „Zurück zur Anmeldung“ und damit anmelden.";
+  }
   $("setupForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (!sb || !FN) return;
@@ -2047,15 +2069,7 @@
       out = await res.json().catch(() => null);
     } catch {}
     if (nr !== setupNr) {
-      // Inzwischen zurück zur Anmeldung oder neu begonnen: nichts überschreiben, nicht selbst anmelden. Nur sagen, dass es
-      // geklappt hat (der Code ist damit verbraucht), und die Namensliste neu laden, damit der Name zur Auswahl steht.
-      if (res && res.ok && out && out.ok && isLocked()) {
-        if (out.id) store.set("kal.loginName", String(out.id));
-        // Den eigenen Namen gleich auswählen, außer es wurde schon ein Name gewählt oder ein Passwort (für jemand anderen) eingetippt
-        loadNames(out.id && !$("loginPw").value ? String(out.id) : undefined, true);
-        if (!$("loginForm").hidden) $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
-        else $("setupErr").textContent = "Das zuerst eingegebene Passwort ist gespeichert, der Code ist damit verbraucht. Bitte „Zurück zur Anmeldung“ und damit anmelden.";
-      }
+      if (res && res.ok && out && out.ok) spaetGespeichert(out);
       return;
     }
     if (!res || !res.ok || !out || !out.ok || !out.email) {
@@ -2066,10 +2080,12 @@
       else if (out && /^(falsch|abgelaufen|kein_code|eingabe)$/.test(out.fehler)) $("setupCode").select();
       return;
     }
-    // Passwort steht: gleich damit anmelden
+    // Passwort steht: gleich damit anmelden. Verlässt die Person das Einrichten, solange signIn noch wartet, meldet es nicht an.
     if (out.id) store.set("kal.loginName", String(out.id));
+    const hier = () => nr === setupNr;
     let error;
-    try { error = await signIn(out.email, pw); } finally { $("setupBtn").disabled = false; }
+    try { error = await signIn(out.email, pw, hier); } finally { if (hier()) $("setupBtn").disabled = false; }
+    if (!hier()) { spaetGespeichert(out); return; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
     if (error === UEBERHOLT) return;
     if (error) { showSetup(false); loadNames(out.id ? String(out.id) : undefined); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
@@ -2133,16 +2149,18 @@
   function hideCode() { $("codeVal").textContent = ""; $("codeFor").textContent = ""; $("codeUntil").textContent = ""; $("codeBox").hidden = true; }
   async function teamAct(body, done) {
     if (teamBusy) return;
-    const gen = teamGen;
+    const gen = teamGen, sg = sitzGen;
     teamBusy = true; $("teamErr").textContent = ""; hideCode();
     teamDlg.querySelectorAll("button").forEach(b => { if (b.id !== "teamClose") b.disabled = true; });
     try {
       const r = await teamCall(body);
-      if (gen !== teamGen || !teamDlg.open || isLocked()) return;
+      if (gen !== teamGen || !teamDlg.open || !gleicheSitzung(sg)) return;
       if (done) done(r);
       await loadTeam();
     }
-    catch (e) { if (gen === teamGen) teamFail(e); }
+    // Abgemeldet, während die Anfrage lief (das close-Ereignis kommt in einem verborgenen Tab erst später):
+    // eine 401 gilt dann der alten Anmeldung und darf keine neue, auch nicht die eines anderen Tabs, abmelden
+    catch (e) { if (gen === teamGen && gleicheSitzung(sg)) teamFail(e); }
     finally {
       // Inzwischen neu geöffnet: Sperre und Knöpfe gehören dem neuen Öffnen
       if (gen === teamGen) {
@@ -2226,10 +2244,10 @@
         + (alt.length ? ` Die offenen Codes aus der Team-Phase (${alt.join(", ")}) werden dabei ungültig; erzeuge danach neue.` : "");
   }
   async function loadTeam() {
-    const gen = teamGen;
+    const gen = teamGen, sg = sitzGen;
     let d;
-    try { d = await teamCall({ aktion: "liste" }); } catch (e) { if (gen === teamGen) teamFail(e); return; }
-    if (gen !== teamGen || !teamDlg.open || isLocked()) return;
+    try { d = await teamCall({ aktion: "liste" }); } catch (e) { if (gen === teamGen && gleicheSitzung(sg)) teamFail(e); return; }
+    if (gen !== teamGen || !teamDlg.open || !gleicheSitzung(sg)) return;
     teamData = d;
     drawTeam();
   }
@@ -2301,11 +2319,11 @@
   }
   async function loadLog(more) {
     if (logBusy) return;
-    const gen = logGen;
+    const gen = logGen, sg = sitzGen;
     logBusy = true; $("logErr").textContent = ""; $("logMore").disabled = true;
     try {
       const rows = await logPage(more ? logLast : null, 100);
-      if (gen !== logGen || !logDlg.open) return;
+      if (gen !== logGen || !logDlg.open || !gleicheSitzung(sg)) return;
       if (!more) $("logList").replaceChildren();
       for (const x of rows) {
         const { was, details } = logText(x);
@@ -2315,7 +2333,7 @@
       if (!more && !rows.length) $("logList").append(el("li", { class: "empty" }, "Noch keine Einträge."));
       logLast = rows.length ? rows[rows.length - 1] : logLast;
       $("logMore").hidden = rows.length < 100;
-    } catch (e) { if (gen === logGen) logFail(e); }
+    } catch (e) { if (gen === logGen && gleicheSitzung(sg)) logFail(e); }
     // Inzwischen neu geöffnet: Knöpfe und Sperre gehören dem neuen Öffnen
     finally { if (gen === logGen) { logBusy = false; $("logMore").disabled = false; } }
   }
@@ -2323,13 +2341,13 @@
   const zelle = (v) => { let s = String(v ?? ""); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
   async function saveLog() {
     if (logBusy) return;
-    const gen = logGen;
+    const gen = logGen, sg = sitzGen;
     logBusy = true; $("logCsv").disabled = true; $("logErr").textContent = "";
     try {
       const all = [];
       for (let vor = null; ;) {
         const rows = await logPage(vor, 500);
-        if (gen !== logGen || !logDlg.open) return;
+        if (gen !== logGen || !logDlg.open || !gleicheSitzung(sg)) return;
         all.push(...rows);
         if (rows.length < 500) break;
         vor = rows[rows.length - 1];
@@ -2342,7 +2360,7 @@
       document.body.append(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       toast("Protokoll wird gespeichert. Vertraulich, enthält Kundendaten.");
-    } catch (e) { if (gen === logGen) logFail(e); }
+    } catch (e) { if (gen === logGen && gleicheSitzung(sg)) logFail(e); }
     finally { if (gen === logGen) { logBusy = false; $("logCsv").disabled = false; } }
   }
   $("logBtn").addEventListener("click", () => {
