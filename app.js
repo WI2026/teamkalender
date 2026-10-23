@@ -1343,6 +1343,8 @@
   let addBusy = -1;
   async function addStep() {
     const inp = $("progNeu"), titel = inp.value.replace(/\s+/g, " ").trim(), pid = progId, gen = progGen, sg = sitzGen;
+    // Projektname vor dem Warten merken: ist das Projekt inzwischen gelöscht, steht er danach nicht mehr bereit
+    const wo = state.projekte.get(pid)?.titel;
     if (!titel || addBusy === gen || !state.canWrite) return;
     addBusy = gen; $("progErr").textContent = "";
     try {
@@ -1353,7 +1355,7 @@
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
     } catch (e) {
       // Ist inzwischen ein anderes Blatt offen: Projekt und Schritt nennen, sonst legt man ihn dort ein zweites Mal an
-      const m = stepError(e, pid, sg), wo = state.projekte.get(pid)?.titel;
+      const m = stepError(e, pid, sg);
       projMeldung(gen === progGen ? pid : null, m,
         m && `Der Schritt „${kurz(titel, 40)}“ wurde${wo ? ` bei „${kurz(wo, 40)}“` : ""} nicht hinzugefügt. ${m === STEP_ALLG ? "Bitte noch einmal versuchen." : m}`, sg);
     }
@@ -1781,14 +1783,23 @@
   // Das laufende Abmelden: eine neue Anmeldung wartet darauf (siehe signIn). Sonst könnte sein Ergebnis oder eine noch
   // laufende Token-Erneuerung des vorigen Kontos die neue Sitzung überschreiben oder löschen.
   let abmelden = Promise.resolve();
+  // Gelungene Anmeldungen (Zähler, Konto der letzten): ein spät scheiterndes Abmelden löscht nicht deren Sitzung
+  let anmeldOk = 0, anmeldMail = "";
   async function lockOut(msg) {
     loginStamp.set(0);
     showLogin(msg);
+    const nr = anmeldOk;
     const lauf = (async () => {
       let failed = true;
       try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
-      // Ohne Antwort vom Server: die Sitzung trotzdem vom Gerät löschen (geteiltes Gerät)
-      if (failed) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
+      if (!failed) return;
+      // Ohne Antwort vom Server: die Sitzung trotzdem vom Gerät löschen (geteiltes Gerät). Gehört sie inzwischen der
+      // nächsten Anmeldung, bleibt sie; eine spät erneuerte Sitzung des vorigen Kontos wird gelöscht.
+      try {
+        const roh = localStorage.getItem(sb.auth.storageKey);
+        let mail = ""; try { mail = String(JSON.parse(roh)?.user?.email || "").toLowerCase(); } catch {}
+        if (roh && (nr === anmeldOk || mail !== anmeldMail)) localStorage.removeItem(sb.auth.storageKey);
+      } catch {}
     })();
     // Auch ein noch laufendes früheres Abmelden abwarten
     abmelden = Promise.all([abmelden, lauf]);
@@ -1899,23 +1910,34 @@
   $("setupLink").addEventListener("click", () => showSetup(true));
   $("backLink").addEventListener("click", () => { showSetup(false); loadNames(); $("loginPw").focus(); });
 
-  // Anmelden mit Adresse und Passwort, danach prüfen, ob das Konto in den Kalender darf
+  // Anmelden mit Adresse und Passwort, danach prüfen, ob das Konto in den Kalender darf.
+  // Ein neuerer Anmeldeversuch (z. B. nach „Zurück zur Anmeldung“ während des Einrichtens) überholt einen älteren:
+  // der ältere ändert dann nichts mehr (UEBERHOLT).
+  const UEBERHOLT = { ueberholt: true };
+  let anmeldNr = 0;
   async function signIn(email, pw) {
+    const nr = ++anmeldNr, aktuell = () => nr === anmeldNr;
     // Erst das vorige Abmelden zu Ende kommen lassen (hängt die Verbindung, höchstens 10 s; die Prüfung unten fängt den Rest ab)
     await Promise.race([abmelden, new Promise(r => setTimeout(r, 10000))]);
+    if (!aktuell()) return UEBERHOLT;
     let error = null, data = null;
     try { ({ data, error } = await sb.auth.signInWithPassword({ email, password: pw })); } catch (e) { error = e; }
+    if (!aktuell()) return UEBERHOLT;
     if (error) return error;
+    const mail = String(data?.session?.user?.email || "").toLowerCase();
+    if (data?.session) { anmeldOk++; anmeldMail = mail; }
     if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
-    myEmail = data.session.user.email.toLowerCase();
     let me;
     try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
+    if (!aktuell()) return UEBERHOLT;
     if (!me.error && !me.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return null; }
     // Gehört die gespeicherte Sitzung noch zu diesem Konto? Ein spätes Abmelden oder eine späte Token-Erneuerung des
     // vorigen Kontos könnte sie gelöscht oder überschrieben haben: dann lieber noch einmal anmelden lassen
     let jetzt = null;
     try { jetzt = (await sb.auth.getSession()).data.session; } catch {}
-    if ((jetzt?.user?.email || "").toLowerCase() !== myEmail) { lockOut("Anmelden hat nicht geklappt. Bitte noch einmal anmelden."); return null; }
+    if (!aktuell()) return UEBERHOLT;
+    if ((jetzt?.user?.email || "").toLowerCase() !== mail) { lockOut("Anmelden hat nicht geklappt. Bitte noch einmal anmelden."); return null; }
+    myEmail = mail;
     state.me = me.error ? null : me.data;
     meAt = me.error ? 0 : Date.now();
     loginStamp.set(Date.now());
@@ -1932,6 +1954,7 @@
     $("loginBtn").disabled = true; $("loginErr").textContent = "";
     let error;
     try { error = await signIn(who.email, pw); } finally { $("loginBtn").disabled = false; }
+    if (error === UEBERHOLT) return;
     if (error) {
       const msg = error.status === 429 ? "Zu viele Versuche. Bitte ein paar Minuten warten."
         : error.code === "user_banned" ? "Dieser Zugang ist gesperrt. Bitte bei der Verwaltung einen neuen Code holen."
@@ -1995,6 +2018,7 @@
     let error;
     try { error = await signIn(out.email, pw); } finally { $("setupBtn").disabled = false; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
+    if (error === UEBERHOLT) return;
     if (error) { showSetup(false); loadNames(out.id ? String(out.id) : undefined); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
     toast("Dein Passwort ist gespeichert");
   });
@@ -2298,10 +2322,11 @@
     // Rückruf bleibt synchron: ein await auf sb.auth hier würde die Anmeldung blockieren.
     sb.auth.onAuthStateChange((event, session) => {
       if (event === "SIGNED_OUT" && !isLocked()) showLogin("Bitte erneut anmelden.");
-      // Gehört die Sitzung plötzlich einem anderen Konto (sehr späte Token-Erneuerung der vorigen Anmeldung, Anmeldung in
-      // einem anderen Tab): abmelden statt unter falschem Namen weiterzuarbeiten. Nicht im Rückruf selbst, der läuft unter der Sperre der Bibliothek.
-      else if (session && myEmail && !isLocked() && (session.user?.email || "").toLowerCase() !== myEmail)
-        setTimeout(() => { if (!isLocked()) lockOut("Bitte erneut anmelden."); });
+      // Gehört die Sitzung plötzlich einem anderen Konto (Anmeldung in einem anderen Tab dieses Browsers): diese Seite sperren
+      // und leeren statt unter falschem Namen weiterzuarbeiten. Nicht abmelden: die Sitzung gehört der neueren Anmeldung.
+      // Nicht im Rückruf selbst, der läuft unter der Sperre der Bibliothek.
+      else if (session && myEmail && !isLocked() && String(session.user?.email || "").toLowerCase() !== myEmail)
+        setTimeout(() => { if (!isLocked()) showLogin("Auf diesem Gerät hat sich inzwischen jemand anderes angemeldet. Bitte erneut anmelden."); });
     });
     const { data } = await sb.auth.getSession();
     const stamp = loginStamp.get();
