@@ -437,6 +437,8 @@
   function openEditor(id, dateStr, start, end, projektVor) {
     const e = id ? state.events.get(id) : null;
     if (id && !e) return;
+    // Neues Öffnen: Antworten, die noch dem vorigen Termin gelten, nicht mehr hier eintragen
+    dlgGen++;
     editingId = id; editingStamp = e ? e.updatedAt : null;
     const ro = !state.canWrite;
     $("dlgTitle").textContent = ro ? "Termin" : (e ? "Termin bearbeiten" : "Neuer Termin");
@@ -513,7 +515,10 @@
     $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null;
     $("f-projekt").replaceChildren(el("option", { value: "" }, "Kein Projekt")); $("progRow").replaceChildren(); $("progRow").removeAttribute("aria-label"); $("progRow").hidden = true;
   }
-  dlg.addEventListener("close", () => { dlgGen++; wipeTermin(); });
+  // Chromium meldet das Schließen erst mit dem nächsten Bild. Ist das Fenster bis dahin schon wieder offen
+  // (langsames Gerät), gehört der Inhalt zum neuen Öffnen und bleibt stehen (sonst würde z. B. aus „Bearbeiten“ ein neuer Termin).
+  // Gilt ebenso für die übrigen Fenster.
+  dlg.addEventListener("close", () => { if (dlg.open) return; dlgGen++; wipeTermin(); });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
   let delTimer = null, delAb = 0;
@@ -1340,6 +1345,7 @@
   }
   // Kundendaten nur so lange im Fenster, wie es offen ist
   progDlg.addEventListener("close", () => {
+    if (progDlg.open) return;
     const id = progId;
     progGen++; progId = null; progTermine = null; progEdit = false; reopenId = null; disarmDel();
     clearTimeout(progTermineT); clearTimeout(reopenT); clearTimeout(progInfoT); $("progBody").replaceChildren();
@@ -1423,7 +1429,7 @@
     $("projForm").reset(); $("projErr").textContent = ""; $("projStamp").textContent = ""; $("p-vorlageListe").replaceChildren(); $("p-werListe").replaceChildren();
     projEditId = projStamp = projNeuId = null; disarm($("projDel"));
   }
-  projDlg.addEventListener("close", wipeProjForm);
+  projDlg.addEventListener("close", () => { if (!projDlg.open) wipeProjForm(); });
   // Vom Browser wiederhergestellte Eingaben (Zurück, wiederhergestellter Tab) gleich verwerfen
   $("form").reset(); $("projForm").reset();
   projDlg.addEventListener("click", (ev) => { if (ev.target === projDlg) projDlg.close(); });
@@ -2023,11 +2029,12 @@
     $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
     $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null;
     disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
-    oeffne(teamDlg); loadTeam();
+    teamGen++; oeffne(teamDlg); loadTeam();
   });
   $("teamClose").addEventListener("click", () => teamDlg.close());
   // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
   teamDlg.addEventListener("close", () => {
+    if (teamDlg.open) return;
     teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn")); teamData = null;
     if (logDlg.open) logDlg.close();
   });
@@ -2135,7 +2142,7 @@
   $("logCsv").addEventListener("click", saveLog);
   $("logClose").addEventListener("click", () => logDlg.close());
   // Kundendaten nur so lange auf dem Bildschirm, wie das Fenster offen ist
-  logDlg.addEventListener("close", () => { logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; });
+  logDlg.addEventListener("close", () => { if (logDlg.open) return; logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; });
   $("addForm").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const name = $("addName").value.replace(/\s+/g, " ").trim(), admin = $("addAdmin").checked;
