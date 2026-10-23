@@ -701,16 +701,35 @@
 
   // ---------- Verbindung (Supabase) ----------
   const CFG = window.KALENDER_CONFIG || {};
-  // Anfragen der Bibliothek an die Anmeldung (Abmelden, Token erneuern) haben sonst keine Zeitgrenze. Solange eine hängt,
-  // hält die Bibliothek ihre Sperre, und eine neue Anmeldung kommt nicht über die Zugangsprüfung hinaus.
+  // Alle Anfragen der Bibliothek laufen hier durch.
+  // - Abmelden hat sonst keine Zeitgrenze: solange es hängt, hält die Bibliothek ihre Sperre, und eine neue Anmeldung kommt nicht
+  //   über die Zugangsprüfung hinaus. Nur das Abmelden: eine abgebrochene Token-Erneuerung würde die Sitzung verlieren.
+  // - Datenbank-Anfragen gehören zu der Anmeldung, in der sie abgeschickt wurden (kalSitz, siehe unten). Wartet eine noch auf ihr
+  //   Token (z. B. hinter einer langsamen Erneuerung) und ist die Anmeldung inzwischen beendet, geht sie nicht mehr hinaus: sonst
+  //   liefe sie mit dem Token der nächsten Person. Liegt inzwischen ein anderes Konto auf dem Gerät, sperrt sich die Seite.
+  //   Ist die Sitzung noch da, aber ohne gültiges Token (Erneuerung gescheitert), ebenfalls nicht: das ist ein Verbindungsproblem
+  //   und kein Abmelden; mit dem öffentlichen Schlüssel käme „Anmeldung abgelaufen“ zurück. Ist gar keine Sitzung mehr da, geht
+  //   sie hinaus und die Antwort sperrt die Seite.
   const AUTH_MS = 15000;
+  const gespeichertVon = () => { try { return String(JSON.parse(localStorage.getItem(sb.auth.storageKey))?.user?.email || "").toLowerCase(); } catch { return ""; } };
   const authFetch = (u, o) => {
-    if (o?.signal || !String(u).includes("/auth/v1/")) return fetch(u, o);
+    if (o && "kalSitz" in o) {
+      const { kalSitz, ...rest } = o, wer = gespeichertVon(), fremd = !!myEmail && !!wer && wer !== myEmail;
+      if (fremd) setTimeout(() => { if (!isLocked()) showLogin(FREMD); });
+      if (kalSitz !== sitzGen || fremd || (wer && new Headers(rest.headers).get("Authorization") === "Bearer " + CFG.key))
+        return Promise.reject(new TypeError("Anmeldung beendet oder nicht erneuert"));
+      return fetch(u, rest);
+    }
+    if (o?.signal || !/\/auth\/v1\/logout(\?|$)/.test(String(u))) return fetch(u, o);
     const ctl = new AbortController();
     setTimeout(() => ctl.abort(new DOMException("signal timed out", "TimeoutError")), AUTH_MS);
     return fetch(u, { ...o, signal: ctl.signal });
   };
   const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }, global: { fetch: authFetch } }) : null;
+  // Die Bibliothek ruft diese Funktion auf, sobald eine Abfrage abgeschickt wird (await), noch bevor sie auf ihr Token wartet:
+  // hier wird die Anfrage an die laufende Anmeldung gebunden. Während der Anmeldemaske (Namensliste, Zugangsprüfung beim
+  // Anmelden) gibt es keine.
+  if (sb) { const restFetch = sb.rest.fetch; sb.rest.fetch = (u, o) => restFetch(u, isLocked() ? o : { ...o, kalSitz: sitzGen }); }
   const fromRow = (r) => ({ title: r.title, date: r.date, allDay: !!r.all_day, start: r.start_time || "", end: r.end_time || "",
     person: r.person || "", note: r.note || "", cat: r.cat || "buero", projektId: r.projekt_id || null, createdAt: r.created_at, updatedAt: r.updated_at });
   const toRow = (b) => Object.assign({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
@@ -2086,8 +2105,9 @@
     const versuch = signIn(out.email, pw, hier), meinVersuch = anmeldNr;
     let error;
     try { error = await versuch; } finally { if (hier()) $("setupBtn").disabled = false; }
-    // Inzwischen hat sich jemand anderes angemeldet oder meldet sich gerade an: dessen Anmeldung bestimmt die Meldung
-    if (!hier()) { if (meinVersuch === anmeldNr) spaetGespeichert(out); return; }
+    // Nur wenn die Person das Einrichten verlassen hat (Versuch abgebrochen) und sich nicht inzwischen jemand anderes anmeldet.
+    // Ist die eigene Anmeldung gescheitert (z. B. kein Zugang), bleibt deren Meldung stehen.
+    if (!hier()) { if (error === UEBERHOLT && meinVersuch === anmeldNr) spaetGespeichert(out); return; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
     if (error === UEBERHOLT) return;
     if (error) { showSetup(false); loadNames(out.id ? String(out.id) : undefined); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
@@ -2101,9 +2121,11 @@
   const teamDlg = $("teamDlg");
   async function teamCall(body) {
     let s;
+    const sg = sitzGen;
     // Erneuern ohne Netz schlägt fehl oder dauert, ist aber kein Abmelden
     try { s = await within(sb.auth.getSession(), 10000); } catch { throw { status: 0 }; }
-    if (s.error) throw { status: 0 };
+    // Inzwischen ab- und vielleicht anders angemeldet: nicht mit dem Token der nächsten Person ausführen
+    if (s.error || sg !== sitzGen) throw { status: 0 };
     const tok = s.data && s.data.session && s.data.session.access_token;
     if (!tok) throw { status: 401 };
     let res;
