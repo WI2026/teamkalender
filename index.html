@@ -142,7 +142,7 @@
 </div>
 
 <dialog id="dlg" aria-labelledby="dlgTitle">
-  <form id="form" method="dialog" novalidate>
+  <form id="form" method="dialog" novalidate autocomplete="off">
     <h4 id="dlgTitle">Neuer Termin</h4>
     <div class="field">
       <label for="f-title">Titel</label>
@@ -186,7 +186,7 @@
     </div>
     <div class="field">
       <label for="f-note">Notiz <span style="font-weight:400;color:var(--fg-3)">(optional)</span></label>
-      <textarea id="f-note" maxlength="1000" placeholder="Adresse, Ansprechpartner, Material …"></textarea>
+      <textarea id="f-note" maxlength="1000" autocomplete="off" placeholder="Adresse, Ansprechpartner, Material …"></textarea>
     </div>
     <div class="err" id="formErr" role="alert"></div>
     <div class="actions">
@@ -256,7 +256,7 @@
 </dialog>
 
 <dialog id="projDlg" aria-labelledby="projDlgTitle">
-  <form id="projForm" method="dialog" novalidate>
+  <form id="projForm" method="dialog" novalidate autocomplete="off">
     <h4 id="projDlgTitle">Neues Projekt</h4>
     <div class="field">
       <label for="p-titel">Kunde und Projekt</label>
@@ -283,7 +283,7 @@
     </div>
     <div class="field">
       <label for="p-notiz">Notiz <span class="opt">(optional)</span></label>
-      <textarea id="p-notiz" maxlength="1000" placeholder="Adresse, Ansprechpartner, Besonderheiten …"></textarea>
+      <textarea id="p-notiz" maxlength="1000" autocomplete="off" placeholder="Adresse, Ansprechpartner, Besonderheiten …"></textarea>
     </div>
     <div class="field" id="p-statusFeld" hidden>
       <span class="lbl" id="pStatusLbl">Stand</span>

@@ -123,6 +123,9 @@
     naechste: new Map(),     // Projekt → nächster Termin ab heute
     pfilter: { status: "laufend", q: "" },
   };
+  // Schritte, die gerade geladen werden, und solche, die nach einem Fehler später erneut geladen werden
+  const stepLaedt = new Set(), stepWarten = new Set();
+  let fertigMax = 100;  // so viele fertige Projekte zeigt die Liste (in Hunderterschritten mehr)
   // Zeitraum ist geladen, wenn ein bereits abgefragter Bereich ihn enthält.
   const covered = (ds) => state.ranges.some(r => ds >= r.from && ds <= r.to);
   let rangeHook = null;
@@ -177,7 +180,7 @@
       const ab = vor ? tsOf(vor.erledigt_am) : p ? parse(p.unterschrieben_am).getTime() : NaN;
       if (!isNaN(ab)) seit = Math.floor((Date.now() - ab) / TAG_MS);
     }
-    return { list, done, total: list.length, pct: list.length ? Math.round(done / list.length * 100) : 0, next, seit, loaded: state.schritteVon.has(pid) };
+    return { list, done, total: list.length, pct: list.length ? Math.round(done / list.length * 100) : 0, next, seit, loaded: state.schritteVon.has(pid) && !stepLaedt.has(pid) };
   }
   const offen = (p) => p.status === "laufend" || p.status === "pausiert";
   const svg = (d, w) => { const n = document.createElementNS("http://www.w3.org/2000/svg", "svg"); n.setAttribute("viewBox", "0 0 16 16"); n.setAttribute("fill", "none"); n.setAttribute("stroke", "currentColor"); n.setAttribute("stroke-width", w || "1.8"); n.setAttribute("stroke-linecap", "round"); n.setAttribute("stroke-linejoin", "round"); n.setAttribute("aria-hidden", "true"); const p = document.createElementNS("http://www.w3.org/2000/svg", "path"); p.setAttribute("d", d); n.append(p); return n; };
@@ -194,12 +197,12 @@
   const fmtTag = (iso) => { const t = new Date(tsOf(iso)); return isNaN(t) ? "" : `${pad(t.getDate())}.${pad(t.getMonth() + 1)}.`; };
   const tageText = (n) => n <= 0 ? "seit heute" : n === 1 ? "seit gestern" : `seit ${n} Tagen`;
   // Projektzeile unter einem Termin: Stand und nächster Schritt, öffnet das Unterfenster. Der Name steht nur da, wenn er nicht schon der Termintitel ist.
-  function projPill(p, terminTitel) {
+  function projPill(p, terminTitel, tid) {
     const f = fortschritt(p.id), gleich = (terminTitel || "").trim().toLowerCase() === p.titel.trim().toLowerCase();
     const stand = !f.loaded ? "…" : f.total ? `${f.done} von ${f.total}` : "keine Schritte";
     const weiter = !f.loaded || !f.total ? null : f.next ? "Als Nächstes: " + f.next.titel : "alle erledigt";
     if (!f.loaded) wantSchritte(p.id);
-    return el("button", { class: "ppill", type: "button", "data-pid": p.id, "aria-label": `Projektfortschritt ${p.titel}: ${stand}${weiter ? ", " + weiter : ""}`, onclick: () => openProg(p.id) },
+    return el("button", { class: "ppill", type: "button", "data-pid": p.id, "data-tid": tid || null, "aria-label": `Projektfortschritt ${p.titel}: ${stand}${weiter ? ", " + weiter : ""}`, onclick: () => openProg(p.id) },
       svgProj(),
       el("span", { class: "pl" }, gleich ? "Projekt" : p.titel),
       el("span", { class: "pc num" }, stand),
@@ -371,7 +374,7 @@
         el("span", { class: "meta" }, el("span", { class: "tag", style: `--c:${catColor(e.cat)}` }, catLabel(e.cat)), e.person ? el("span", null, "· " + e.person) : null),
         e.note ? el("span", { class: "note" }, e.note) : null));
     const pr = e.projektId && state.projekte.get(e.projektId);
-    return pr ? el("div", { class: "itemw" }, card, projPill(pr, e.title)) : card;
+    return pr ? el("div", { class: "itemw" }, card, projPill(pr, e.title, e.id)) : card;
   }
 
   function renderAgenda() {
@@ -499,10 +502,13 @@
 
   $("cancelBtn").addEventListener("click", () => dlg.close());
   // Kundendaten nur so lange im Formular halten, wie es offen ist.
-  dlg.addEventListener("close", () => {
+  // Auch beim Abmelden aufgerufen, ob das Fenster offen ist oder nicht (eine späte Antwort könnte es sonst wieder gefüllt haben)
+  let dlgGen = 0;
+  function wipeTermin() {
     $("form").reset(); $("stamp").textContent = ""; $("formErr").textContent = ""; editingId = editingStamp = null;
     $("f-projekt").replaceChildren(el("option", { value: "" }, "Kein Projekt")); $("progRow").replaceChildren(); $("progRow").removeAttribute("aria-label"); $("progRow").hidden = true;
-  });
+  }
+  dlg.addEventListener("close", () => { dlgGen++; wipeTermin(); });
   dlg.addEventListener("click", (ev) => { if (ev.target === dlg) dlg.close(); });
 
   let delTimer = null, delAb = 0;
@@ -570,11 +576,13 @@
 
   // ---------- Toast ----------
   let toastT = null;
-  function toast(msg) {
+  function toast(msg, ms) {
     const t = $("toast"); t.textContent = msg; t.hidden = false;
     if (t.showPopover) { try { t.hidePopover(); } catch {} try { t.showPopover(); } catch {} }
-    clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; if (t.hidePopover) try { t.hidePopover(); } catch {} }, 2200);
+    clearTimeout(toastT); toastT = setTimeout(hideToast, ms || 2200);
   }
+  // Der Text kann einen Projektnamen enthalten: nach dem Ausblenden nicht im Dokument stehen lassen
+  function hideToast() { clearTimeout(toastT); const t = $("toast"); t.hidden = true; t.textContent = ""; if (t.hidePopover) try { t.hidePopover(); } catch {} }
 
   // ---------- Status ----------
   // Der Zusatz steht auf dem Handy nicht da, damit Name und Abmelden neben die Marke passen
@@ -725,7 +733,7 @@
   const PCOLS = "id,titel,art,unterschrieben_am,auftragsnr,verantwortlich,notiz,status,updated_at";
   const SCOLS = "id,projekt_id,pos,titel,erledigt,erledigt_am,erledigt_von,updated_at";
   // Live-Änderungen während einer laufenden Abfrage (Kennung → Zeile oder null für gelöscht); die ältere Abfrage überschreibt sie nicht
-  let projSeq = 0, pTouched = new Map(), sTouched = new Map(), stepFailAt = 0, projRetryT = null;
+  let projSeq = 0, pTouched = new Map(), sTouched = new Map(), stepFailAt = 0, stepPause = 0, projRetryT = null, stepRetryT = 0;
   // Stand der Datenbank beim letzten vollständigen Laden (oder danach live bestätigt). Gleich beim Wiederverbinden: nichts neu laden.
   let projStand = null, projRetryMs = 5000;
   const newer = (cur, r) => !cur || tsOf(r.updated_at) >= tsOf(cur.updated_at);
@@ -856,9 +864,12 @@
   // Schritte einzelner Projekte nachladen (fertige Projekte, neu angelegte, wieder geöffnete)
   async function ensureSchritte(ids) {
     const need = [...new Set(ids)].filter(id => id && !state.schritteVon.has(id) && state.projekte.has(id));
-    if (!need.length || !sb || isLocked() || Date.now() - stepFailAt < 15000) return;
+    if (!need.length || !sb || isLocked()) return;
+    // Kurz nach einem Fehler nicht gleich wieder fragen, aber auch nicht aufgeben
+    const warte = stepPause - (Date.now() - stepFailAt);
+    if (warte > 0) { spaeterSchritte(need, warte); return; }
     const seq = projSeq;
-    need.forEach(id => state.schritteVon.add(id));
+    need.forEach(id => { state.schritteVon.add(id); stepLaedt.add(id); stepWarten.delete(id); });
     try {
       for (let i = 0; i < need.length; i += 100) {
         const chunk = need.slice(i, i + 100);
@@ -866,12 +877,19 @@
         if (!part) return;
         for (const r of part) if (sTouched.get(r.id) !== null) applySchritt(r);
       }
+      stepPause = 0;
     } catch (e) {
       if (seq !== projSeq || projFail(e)) return;
-      stepFailAt = Date.now();
+      stepFailAt = Date.now(); stepPause = Math.min(stepPause ? stepPause * 2 : 15000, 120000);
       need.forEach(id => state.schritteVon.delete(id));
-    }
+      spaeterSchritte(need, stepPause);
+    } finally { need.forEach(id => stepLaedt.delete(id)); }
     afterProj();
+  }
+  // Nach einem Fehler später erneut laden (sonst bliebe „wird geladen“ stehen, bis zufällig etwas neu zeichnet)
+  function spaeterSchritte(ids, ms) {
+    ids.forEach(id => stepWarten.add(id));
+    if (!stepRetryT) stepRetryT = setTimeout(() => { stepRetryT = 0; const l = [...stepWarten]; stepWarten.clear(); ensureSchritte(l); }, ms);
   }
   // Schritte, die eine Anzeige braucht (Projektzeile am Termin, Unterfenster), gesammelt nachladen
   let wantSet = new Set(), wantT = 0;
@@ -902,7 +920,7 @@
 
   // ---------- Übersicht (Reiter Projekte) ----------
   $("projSearch").addEventListener("input", (e) => { state.pfilter.q = e.target.value; renderProjekte(); });
-  document.querySelectorAll("#statusSeg button").forEach(b => b.addEventListener("click", () => { state.pfilter.status = b.dataset.status; renderProjekte(); }));
+  document.querySelectorAll("#statusSeg button").forEach(b => b.addEventListener("click", () => { state.pfilter.status = b.dataset.status; fertigMax = 100; renderProjekte(); }));
   const kurzTermin = (x) => { const d = parse(x.date); return `${DOW[dowIdx(d)]} ${d.getDate()}.${d.getMonth() + 1}.${x.all_day ? "" : " · " + x.start_time}`; };
   // Laufend = laufend und pausiert, Fertig = abgeschlossen und storniert
   const gruppe = (p) => offen(p) ? "laufend" : "fertig";
@@ -922,7 +940,9 @@
     // Laufende: der älteste Auftrag zuerst, pausierte am Ende. Fertige: zuletzt geändert zuerst.
     list.sort(f.status === "fertig" ? (a, b) => tsOf(b.updated_at) - tsOf(a.updated_at) || a.titel.localeCompare(b.titel, "de")
       : (a, b) => (a.status === "pausiert") - (b.status === "pausiert") || a.unterschrieben_am.localeCompare(b.unterschrieben_am) || a.titel.localeCompare(b.titel, "de"));
-    if (f.status === "fertig") ensureSchritte(list.slice(0, 100).map(p => p.id));
+    // Fertige Projekte in Hunderterschritten zeigen; Schritte nur für die gezeigten laden (spart Datenvolumen)
+    const zeige = f.status === "fertig" ? list.slice(0, fertigMax) : list;
+    if (f.status === "fertig") ensureSchritte(zeige.map(p => p.id));
     const box = $("projList");
     box.setAttribute("aria-busy", String(!state.projLoaded));
     if (!state.projLoaded) {
@@ -940,7 +960,10 @@
         leer && state.canWrite ? el("button", { class: "btn primary", type: "button", onclick: () => openProjForm(null, false) }, svgPlus(), "Neues Projekt") : null));
       return;
     }
-    box.replaceChildren(el("ul", { class: "prows" }, list.map(p => el("li", null, projRow(p)))));
+    const rest = list.length - zeige.length;
+    fill(box, el("ul", { class: "prows" }, zeige.map(p => el("li", null, projRow(p)))),
+      rest > 0 ? el("div", { class: "pmehr" }, el("button", { class: "btn", type: "button", onclick: () => { fertigMax += 100; renderProjekte(); } },
+        `Weitere ${Math.min(rest, 100)} von ${rest} anzeigen`)) : null);
   }
   function projRow(p) {
     const f = fortschritt(p.id), nx = state.naechste.get(p.id);
@@ -961,11 +984,13 @@
 
   // ---------- Unterfenster: Fortschritt eines Projekts ----------
   const progDlg = $("progDlg");
-  let progId = null, progGen = 0, progFromEditor = false, progTermine = null, progEdit = false, progAlle = false;
+  let progId = null, progGen = 0, progFromEditor = false, progTermine = null, progEdit = false, progAlle = false, progOpener = null;
   const stepBusy = new Set();
   function openProg(id) {
     if (!state.projekte.has(id)) return;
     meBald();
+    const act = document.activeElement;
+    progOpener = act && act.matches && act.matches(".prow, .ppill") ? act : null;
     progId = id; progGen++; progFromEditor = dlg.open; progTermine = null; progEdit = false; progAlle = false;
     $("progBody").replaceChildren(
       el("header", { class: "phead", id: "progHead" }),
@@ -1027,7 +1052,7 @@
   function renderProg() {
     const p = state.projekte.get(progId);
     if (!p) return;
-    const f = fortschritt(p.id), ro = !state.canWrite, edit = progEdit && !ro;
+    const f = fortschritt(p.id), ro = !state.canWrite, edit = progEdit && !ro, fehl = !f.loaded && stepWarten.has(p.id);
     const act = document.activeElement, focusSid = act && act.closest && act.closest("#progSteps [data-sid]")?.dataset.sid;
     const focusCls = act && act.classList ? [...act.classList].find(c => c === "reopen" || c === "sdel") || "" : "";
     fill($("progHead"),
@@ -1041,7 +1066,10 @@
           onclick: () => openProjForm(p.id, false) }, svgEdit()),
         el("button", { class: "btn icon ghost pclose", type: "button", "aria-label": "Schließen", onclick: () => progDlg.close() }, svgX())));
     fill($("progStand"),
-      el("div", { class: "pzahl" }, el("strong", { class: "num" }, !f.loaded ? "…" : f.total ? `${f.done} von ${f.total}` : "0"), el("span", null, f.loaded && f.total ? "Schritten erledigt" : f.loaded ? "Noch keine Schritte" : "Schritte werden geladen")),
+      el("div", { class: "pzahl" }, el("strong", { class: "num" }, !f.loaded ? "…" : f.total ? `${f.done} von ${f.total}` : "0"),
+        el("span", null, f.loaded && f.total ? "Schritten erledigt" : f.loaded ? "Noch keine Schritte" : fehl ? "Schritte konnten nicht geladen werden" : "Schritte werden geladen")),
+      fehl ? el("div", { class: "pfehl" }, el("span", null, "Neuer Versuch läuft gleich von selbst."),
+        el("button", { class: "btn small", type: "button", onclick: () => { stepFailAt = 0; ensureSchritte([p.id]); renderProg(); } }, "Jetzt erneut versuchen")) : null,
       pbar(f, "big"),
       f.loaded && f.next ? el("p", { class: "pnext2" }, el("span", { class: "k" }, "Als Nächstes"), el("span", null, f.next.titel), offen(p) && f.seit != null ? el("span", { class: "seit" }, tageText(f.seit)) : null) : null,
       f.loaded && f.total && !f.next && offen(p) && !ro
@@ -1154,11 +1182,20 @@
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut versuchen.";
     return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
   };
+  // Fehler zu einem Projekt: im Fenster, solange es dieses Projekt zeigt, sonst unten am Bildschirm
+  // (sonst bliebe z. B. ein zurückgenommenes Häkchen nach dem Schließen unbemerkt)
+  function projMeldung(pid, m, sonst) {
+    if (!m) return;
+    if (progDlg.open && progId === pid && $("progErr")) $("progErr").textContent = m;
+    else toast(sonst || m, 7000);
+  }
   // Abhaken: sofort anzeigen, bei Fehler zurücknehmen. „Wer und wann“ trägt die Datenbank ein.
   async function toggleStep(sid, on) {
     const prev = state.schritte.get(sid);
     if (!prev || !state.canWrite || stepBusy.has(sid)) return;
     stepBusy.add(sid); $("progErr").textContent = "";
+    const pid = prev.projekt_id, wer = state.projekte.get(pid)?.titel || "";
+    const nicht = `„${prev.titel}“${wer ? " bei " + wer : ""} wurde nicht ${on ? "abgehakt" : "wieder geöffnet"}. Bitte noch einmal versuchen.`;
     // Vorläufige Anzeige behält den alten Zeitstempel: jede Antwort der Datenbank ist neuer und ersetzt sie
     const opt = { ...prev, erledigt: on, erledigt_am: on ? new Date().toISOString() : null, erledigt_von: on ? (state.me && state.me.name) || "" : null };
     state.schritte.set(sid, opt);
@@ -1174,12 +1211,12 @@
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked()) return;
         if (now.error) throw now.error;
-        if (now.data) { putSchritt(now.data); if (progDlg.open) $("progErr").textContent = "Speichern hat nicht geklappt. Bitte erneut versuchen."; }
-        else { dropSchritt(sid); progInfo("Diesen Schritt hat gerade jemand gestrichen."); }
+        if (now.data) { putSchritt(now.data); projMeldung(pid, "Speichern hat nicht geklappt. Bitte erneut versuchen.", nicht); }
+        else { dropSchritt(sid); if (progDlg.open && progId === pid) progInfo("Diesen Schritt hat gerade jemand gestrichen."); }
       }
     } catch (e) {
       if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
-      const m = stepError(e); if (m && progDlg.open) $("progErr").textContent = m;
+      projMeldung(pid, stepError(e), nicht);
     } finally { stepBusy.delete(sid); afterProj(); }
   }
   let addBusy = false;
@@ -1193,7 +1230,7 @@
       check(res);
       putSchritt(res.data);
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
-    } catch (e) { const m = stepError(e); if (m && gen === progGen && progDlg.open) $("progErr").textContent = m; }
+    } catch (e) { const m = stepError(e); if (m && gen === progGen && progDlg.open) $("progErr").textContent = m; else if (m) toast(`Der Schritt „${titel}“ wurde nicht hinzugefügt. Bitte noch einmal versuchen.`, 7000); }
     finally { addBusy = false; afterProj(); }
   }
   async function delStep(sid) {
@@ -1224,9 +1261,9 @@
     try {
       const res = await sb.from(PT).update({ status }).eq("id", p.id).eq("updated_at", p.updated_at).select(PCOLS);
       check(res);
-      if (res.data.length) { putProjekt(res.data[0]); progInfo(status === "abgeschlossen" ? "Projekt ist fertig." : "Gespeichert."); }
-      else { $("progErr").textContent = "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen."; await reloadProjekt(p.id); }
-    } catch (e) { const m = stepError(e); if (m && progDlg.open) $("progErr").textContent = m; }
+      if (res.data.length) { putProjekt(res.data[0]); if (progDlg.open && progId === p.id) progInfo(status === "abgeschlossen" ? "Projekt ist fertig." : "Gespeichert."); }
+      else { projMeldung(p.id, "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen."); await reloadProjekt(p.id); }
+    } catch (e) { projMeldung(p.id, stepError(e), `„${p.titel}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`); }
     finally { if (btn) btn.disabled = false; afterProj(); }
   }
   async function reloadProjekt(id) {
@@ -1241,9 +1278,14 @@
     const id = progId;
     progGen++; progId = null; progTermine = null; progEdit = false; reopenId = null; disarmDel();
     clearTimeout(progTermineT); clearTimeout(reopenT); clearTimeout(progInfoT); $("progBody").replaceChildren();
-    // Das Element, das das Fenster geöffnet hat, wurde inzwischen evtl. neu gezeichnet: Fokus auf seinen Nachfolger
-    if (id && !isLocked() && (!document.activeElement || document.activeElement === document.body))
-      document.querySelector(`.prow[data-pid="${CSS.escape(id)}"], .ppill[data-pid="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+    // Das Element, das das Fenster geöffnet hat, wurde inzwischen evtl. neu gezeichnet: Fokus auf seinen sichtbaren Nachfolger
+    const op = progOpener; progOpener = null;
+    if (id && !isLocked() && (!document.activeElement || document.activeElement === document.body)) {
+      const sicht = (n) => !!n && n.isConnected && n.getClientRects().length > 0;
+      const q = op && op.dataset.tid ? `.ppill[data-pid="${CSS.escape(id)}"][data-tid="${CSS.escape(op.dataset.tid)}"]`
+        : `.prow[data-pid="${CSS.escape(id)}"], .ppill[data-pid="${CSS.escape(id)}"]`;
+      (sicht(op) ? op : [...document.querySelectorAll(q)].find(sicht))?.focus({ preventScroll: true });
+    }
   });
   progDlg.addEventListener("click", (ev) => { if (ev.target === progDlg) progDlg.close(); });
 
@@ -1290,7 +1332,12 @@
     $("p-datum").max = ymd(addDays(new Date(), 1));
     $("p-nr").value = p ? p.auftragsnr || "" : "";
     $("p-wer").value = p ? p.verantwortlich || "" : (state.me && !state.me.team && state.me.name) || "";
-    $("p-werListe").replaceChildren(...names.filter(n => !n.team).map(n => el("option", { value: n.name })));
+    // Vorschläge: Namen der Zugänge (nur nach Anmeldung mit Namensliste bekannt), der eigene Name und die schon eingetragenen
+    const wer = new Map();
+    for (const n of [...names.filter(n => !n.team).map(n => n.name), state.me && !state.me.team ? state.me.name : "", ...[...state.projekte.values()].map(x => x.verantwortlich)]) {
+      const t = (n || "").trim(); if (t && !wer.has(t.toLowerCase())) wer.set(t.toLowerCase(), t);
+    }
+    $("p-werListe").replaceChildren(...[...wer.values()].sort((a, b) => a.localeCompare(b, "de")).map(n => el("option", { value: n })));
     $("p-notiz").value = p ? p.notiz || "" : "";
     $("p-statusFeld").hidden = !p;
     if (p) $(`pst-${p.status in STAND ? p.status : "laufend"}`).checked = true;
@@ -1306,10 +1353,13 @@
     projDlg.showModal();
   }
   $("projCancel").addEventListener("click", () => projDlg.close());
-  projDlg.addEventListener("close", () => {
+  function wipeProjForm() {
     $("projForm").reset(); $("projErr").textContent = ""; $("projStamp").textContent = ""; $("p-vorlageListe").replaceChildren(); $("p-werListe").replaceChildren();
     projEditId = projStamp = projNeuId = null; disarm($("projDel"));
-  });
+  }
+  projDlg.addEventListener("close", wipeProjForm);
+  // Vom Browser wiederhergestellte Eingaben (Zurück, wiederhergestellter Tab) gleich verwerfen
+  $("form").reset(); $("projForm").reset();
   projDlg.addEventListener("click", (ev) => { if (ev.target === projDlg) projDlg.close(); });
   const projWriteError = (e) => {
     if (projFail(e)) return "";
@@ -1360,7 +1410,13 @@
         if (isLocked()) return;
         if (one.data) putProjekt(one.data);
         const d = one.data;
-        if (res.error && d && !(d.titel === titel && d.art === art && d.unterschrieben_am === datum && (d.auftragsnr || "") === nr
+        if (res.error && !d) {
+          // Nicht bestätigt, dass das Projekt da ist: Fenster offen lassen. Ist es inzwischen gelöscht, legt der nächste Versuch es neu an.
+          if (one.error) throw one.error;
+          projNeuId = crypto.randomUUID();
+          throw res.error;
+        }
+        if (res.error && !(d.titel === titel && d.art === art && d.unterschrieben_am === datum && (d.auftragsnr || "") === nr
             && (d.verantwortlich || "") === wer && (d.notiz || "") === notiz)) {
           // Dazwischen wurde etwas geändert: nicht stillschweigend verwerfen, sondern als Bearbeiten weiterführen
           projEditId = id; projStamp = d.updated_at; projNeuId = null;
@@ -1371,15 +1427,17 @@
           $("projErr").textContent = "Das Projekt war beim ersten Versuch schon angelegt. „Speichern“ übernimmt deine Änderungen, die Schritte passt du danach unter „Schritte bearbeiten“ an.";
           return;
         }
-        const forEditor = projForEditor && dlg.open;
+        const forEditor = projForEditor && dlg.open, g = dlgGen;
         projDlg.close();
         if (one.data) await ensureSchritte([id]);
         if (isLocked()) return;
-        if (forEditor) {
+        // Termin inzwischen geschlossen (oder ein anderer offen): nichts mehr hineinschreiben
+        if (forEditor && dlg.open && g === dlgGen) {
           fillProjSelect(id);
           if (!$("f-title").value.trim()) $("f-title").value = titel.slice(0, 120);
           $("f-projekt").focus();
-        } else {
+        } else if (forEditor) toast("Projekt angelegt");
+        else {
           state.pfilter.status = "laufend"; render();
           // Gleich die Checkliste zeigen
           if (state.projekte.has(id)) { openProg(id); progInfo("Projekt angelegt."); } else toast("Projekt angelegt");
@@ -1529,7 +1587,10 @@
     if ($("logDlg").open) $("logDlg").close();
     if (progDlg.open) progDlg.close();
     if (projDlg.open) projDlg.close();
-    projSeq++; naechsteSeq++; clearTimeout(projRetryT); clearTimeout(naechsteT); stepFailAt = 0;
+    // Formulare und Unterfenster immer leeren, auch wenn sie gerade zu sind (späte Antworten, vom Browser wiederhergestellte Eingaben)
+    wipeTermin(); wipeProjForm(); $("progBody").replaceChildren(); progOpener = null; hideToast();
+    projSeq++; naechsteSeq++; clearTimeout(projRetryT); clearTimeout(naechsteT); stepFailAt = 0; stepPause = 0;
+    clearTimeout(stepRetryT); stepRetryT = 0; stepWarten.clear(); stepLaedt.clear(); fertigMax = 100;
     pTouched = new Map(); sTouched = new Map(); stepBusy.clear(); wantSet.clear(); clearTimeout(wantT); wantT = 0; disarmDel();
     state.projekte = new Map(); state.schritte = new Map(); state.schritteVon = new Set(); state.naechste = new Map(); state.projLoaded = false; stepIdx = null;
     state.pfilter.q = ""; $("projSearch").value = ""; state.projErr = false;
