@@ -545,7 +545,7 @@
       else if (gleicheSitzung(sg)) toast(`„${kurz(name, 40)}“ gelöscht`);
       render();
     } catch (err) {
-      const h = hier(), m = writeError(err, h);
+      const h = hier(), m = writeError(err, h, sg);
       if (h) $("formErr").textContent = m === STEP_ALLG ? "Löschen hat nicht geklappt. Prüfe die Verbindung und versuche es erneut." : m;
       else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
     } finally { if (g === dlgGen) { b.disabled = false; $("saveBtn").disabled = false; } if (deletingId === id) deletingId = null; }
@@ -596,21 +596,22 @@
         else if (liveZuGen !== g && gleicheSitzung(sg)) toast(nichtText(title, "gespeichert", "Er wurde inzwischen gelöscht."), 7000);
         return;
       }
-      const m = writeError(e2, h);
+      const m = writeError(e2, h, sg);
       if (h) $("formErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(title, prev ? "gespeichert" : "eingetragen", m), 7000);
     } finally { if (g === dlgGen) { $("saveBtn").disabled = false; $("delBtn").disabled = false; } }
   });
 
   // hier: das Fenster zeigt noch den Termin, für den die Antwort kam. Sonst ändert die Meldung nichts im Formular
   // und ist für eine kurze Meldung mit Namen gedacht (siehe nichtText).
-  function writeError(e, hier) {
+  function writeError(e, hier, sg) {
     const code = e && e.code;
     if (code === "conflict") {
       if (!hier) return "Jemand hat ihn gerade geändert. Bitte öffnen und noch einmal speichern.";
       editingStamp = state.events.get(editingId)?.updatedAt || null;
       return "Jemand hat diesen Termin gerade geändert. Abbrechen zeigt die neue Fassung, Speichern überschreibt sie mit deiner.";
     }
-    if (loggedOut(e)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return ""; }
+    // Abgelaufen: nur die Anmeldung abmelden, in der die Anfrage lief (nicht eine inzwischen neue)
+    if (loggedOut(e)) { if (gleicheSitzung(sg)) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return ""; }
     if (code === "23514" || code === "22001") return "Ein Feld ist ungültig oder zu lang. Titel bis 120, Name bis 60, Notiz bis 1000 Zeichen.";
     if (code === "23503") {
       if (!hier) return "Das gewählte Projekt gibt es nicht mehr.";
@@ -710,15 +711,19 @@
   const isLocked = () => document.body.classList.contains("locked");
   // Termine, die sich während einer laufenden Abfrage geändert haben; die ältere Abfrage überschreibt sie nicht.
   let touched = new Set();
+  // Termine, deren Löschung diese Anmeldung schon kennt. Erst ein neues Anlegen mit derselben Kennung (Live-Nachricht INSERT)
+  // oder eine danach begonnene Abfrage, die ihn wieder liefert, hebt das auf (z. B. von Hand wiederhergestellt).
+  let geloescht = new Set();
   // Eine Änderung nur übernehmen, wenn sie nicht älter ist als der bekannte Stand (Zeit vergibt die Datenbank).
   function putRow(r) {
-    if (isLocked()) return;
+    // Gelöscht bleibt gelöscht: eine späte Antwort (z. B. aufs Speichern) holt ihn nicht zurück
+    if (isLocked() || geloescht.has(r.id)) return;
     touched.add(r.id);
     const cur = state.events.get(r.id);
     if (cur && tsOf(cur.updatedAt) > tsOf(r.updated_at)) return;
     state.events.set(r.id, fromRow(r));
   }
-  function dropRow(id) { if (!id) return; touched.add(id); state.events.delete(id); }
+  function dropRow(id) { if (!id) return; touched.add(id); geloescht.add(id); state.events.delete(id); }
   function afterChange() {
     if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) { liveZuGen = dlgGen; dlg.close(); toast("Dieser Termin wurde gerade von jemand anderem gelöscht"); }
     render();
@@ -731,6 +736,8 @@
         let q = sb.from(T).update(toRow(b)).eq("id", id);
         if (stamp) q = q.eq("updated_at", stamp);
         const res = await q.select(COLS); check(res);
+        // Gespeichert, aber inzwischen gelöscht (Live-Nachricht kam vor dieser Antwort): wie eine Löschung behandeln
+        if (res.data.length && geloescht.has(id)) { afterChange(); throw { code: "conflict" }; }
         if (res.data.length) { putRow(res.data[0]); return; }
         const now = await sb.from(T).select(COLS).eq("id", id).maybeSingle(); check(now);
         if (isLocked()) throw { code: "conflict" };
@@ -747,7 +754,7 @@
   let loadSeq = 0, lastRangeKey = "", navT = null, retryT = null, retryMs = 5000;
   async function refresh() {
     clearTimeout(navT); clearTimeout(retryT);
-    const r = visibleRange(), seq = ++loadSeq, rows = [], seen = touched = new Set();
+    const r = visibleRange(), seq = ++loadSeq, rows = [], seen = touched = new Set(), vorherWeg = new Set(geloescht);
     lastRangeKey = r.from + r.to;
     for (let from = 0; ; from += PAGE) {
       const { data, error } = await sb.from(T).select(COLS).gte("date", r.from).lte("date", r.to).order("date").order("id").range(from, from + PAGE - 1);
@@ -764,7 +771,8 @@
     }
     if (isLocked()) return;
     for (const [id, e] of state.events) if (e.date >= r.from && e.date <= r.to && !seen.has(id)) state.events.delete(id);
-    for (const row of rows) if (!seen.has(row.id)) putRow(row);
+    // Schon vor dieser Abfrage gelöscht und trotzdem geliefert: es gibt ihn wieder
+    for (const row of rows) if (!seen.has(row.id)) { if (vorherWeg.has(row.id)) geloescht.delete(row.id); putRow(row); }
     // Ein offener Termin, der nicht mehr im Zeitraum liegt, wurde vielleicht nur verschoben.
     if (dlg.open && editingId && editingId !== deletingId && !state.events.has(editingId)) {
       const one = await sb.from(T).select(COLS).eq("id", editingId).maybeSingle();
@@ -835,7 +843,9 @@
   let projRaf = 0;
   const afterProjBald = () => { if (!projRaf) projRaf = requestAnimationFrame(() => { projRaf = 0; afterProj(); }); };
   // Abgelaufene Anmeldung: abmelden. Fehlendes Recht (42501) kann auch nur eine Spalte betreffen: dann nur nachfragen, ob der Zugang noch gilt.
-  const projFail = (e) => {
+  // sg: Anmeldung, in der die Anfrage lief. Antworten einer vorigen Anmeldung gelten als erledigt.
+  const projFail = (e, sg = sitzGen) => {
+    if (!gleicheSitzung(sg)) return true;
     if (e && e.code === "42501") { checkMe(); return false; }
     if (loggedOut(e)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return true; }
     return false;
@@ -1266,10 +1276,11 @@
     if (!dabei && !(p.new && p.new.projekt_id === progId)) return;
     clearTimeout(progTermineT); progTermineT = setTimeout(loadProgTermine, 800);
   }
-  const stepError = (e) => {
-    if (projFail(e)) return "";
+  // pid: Projekt, zu dem die Anfrage gehörte (nicht unbedingt das gerade offene)
+  const stepError = (e, pid, sg) => {
+    if (projFail(e, sg)) return "";
     if (e && e.code === "23514") return e.hint === "schritte_max" || /40 Schritte/.test(e.message || "") ? "Mehr als 40 Schritte je Projekt gehen nicht." : "Der Schritt ist zu lang (höchstens 80 Zeichen).";
-    if (e && e.code === "23503") { if (progId) reloadProjekt(progId); return "Dieses Projekt gibt es nicht mehr."; }
+    if (e && e.code === "23503") { if (pid) reloadProjekt(pid); return "Dieses Projekt gibt es nicht mehr."; }
     if (e && e.code === "42501") return "Keine Berechtigung. Lade die Seite neu und versuche es noch einmal.";
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut versuchen.";
     return STEP_ALLG;
@@ -1325,7 +1336,7 @@
       }
     } catch (e) {
       if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
-      projMeldung(pid, hierText(stepError(e)), nicht, sg);
+      projMeldung(pid, hierText(stepError(e, pid, sg)), nicht, sg);
     } finally { stepBusy.delete(sid); afterProj(); }
   }
   // Sperrt nur das Blatt, in dem gerade hinzugefügt wird (Nummer des Öffnens): ein danach geöffnetes Blatt bleibt bedienbar
@@ -1340,12 +1351,18 @@
       check(res);
       putSchritt(res.data);
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
-    } catch (e) { projMeldung(gen === progGen ? pid : null, stepError(e), `Der Schritt „${kurz(titel, 40)}“ wurde nicht hinzugefügt. Bitte noch einmal versuchen.`, sg); }
+    } catch (e) {
+      // Ist inzwischen ein anderes Blatt offen: Projekt und Schritt nennen, sonst legt man ihn dort ein zweites Mal an
+      const m = stepError(e, pid, sg), wo = state.projekte.get(pid)?.titel;
+      projMeldung(gen === progGen ? pid : null, m,
+        m && `Der Schritt „${kurz(titel, 40)}“ wurde${wo ? ` bei „${kurz(wo, 40)}“` : ""} nicht hinzugefügt. ${m === STEP_ALLG ? "Bitte noch einmal versuchen." : m}`, sg);
+    }
     finally { if (addBusy === gen) addBusy = -1; afterProj(); }
   }
   async function delStep(sid) {
     $("progErr").textContent = "";
-    const pid = progId, sg = sitzGen;
+    const pid = progId, sg = sitzGen, gen = progGen, s0 = state.schritte.get(sid), wo = state.projekte.get(pid)?.titel;
+    const was = `${s0 ? `„${kurz(s0.titel, 40)}“` : "Ein Schritt"}${wo ? ` bei „${kurz(wo, 40)}“` : ""}`;
     // Nach dem Streichen den Fokus auf den nächsten Schritt setzen (sonst landet er bei Tastatur und VoiceOver im Nichts)
     const list = stepsOf(progId), i = list.findIndex(x => x.id === sid), nb = (list[i + 1] || list[i - 1] || {}).id;
     try {
@@ -1356,12 +1373,12 @@
         // Gerade von jemand anderem abgehakt (erledigte streichen nur Verwalter) oder schon weg
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked()) return;
-        if (now.data) { putSchritt(now.data); projMeldung(pid, "Erledigte Schritte können nur Verwalter streichen.", null, sg); }
+        if (now.data) { putSchritt(now.data); projMeldung(pid, "Erledigte Schritte können nur Verwalter streichen.", `${was} wurde nicht gestrichen: Erledigte Schritte können nur Verwalter streichen.`, sg); }
         else if (!now.error) dropSchritt(sid);
       }
-    } catch (e) { projMeldung(pid, stepError(e), "Ein Schritt wurde nicht gestrichen. Bitte noch einmal versuchen.", sg); }
+    } catch (e) { const m = stepError(e, pid, sg); projMeldung(pid, m, m && `${was} wurde nicht gestrichen. ${m === STEP_ALLG ? "Bitte noch einmal versuchen." : m}`, sg); }
     afterProj();
-    if (progDlg.open && !progDlg.contains(document.activeElement)) {
+    if (gen === progGen && progDlg.open && !progDlg.contains(document.activeElement)) {
       const row = nb && $("progSteps").querySelector(`[data-sid="${CSS.escape(nb)}"]`);
       (row?.querySelector(".sdel") || row?.querySelector("input") || $("progNeu"))?.focus({ preventScroll: true });
     }
@@ -1375,7 +1392,7 @@
       check(res);
       if (res.data.length) { putProjekt(res.data[0]); if (progDlg.open && progId === p.id) progInfo(status === "abgeschlossen" ? "Projekt ist fertig." : "Gespeichert."); }
       else { projMeldung(p.id, "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen.", `„${kurz(p.titel, 40)}“ hat gerade jemand geändert. Bitte noch einmal prüfen.`, sg); await reloadProjekt(p.id); }
-    } catch (e) { projMeldung(p.id, stepError(e), `„${kurz(p.titel, 40)}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`, sg); }
+    } catch (e) { projMeldung(p.id, stepError(e, p.id, sg), `„${kurz(p.titel, 40)}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`, sg); }
     finally { if (btn) btn.disabled = false; afterProj(); }
   }
   async function reloadProjekt(id) {
@@ -1478,8 +1495,8 @@
   // Vom Browser wiederhergestellte Eingaben (Zurück, wiederhergestellter Tab) gleich verwerfen
   $("form").reset(); $("projForm").reset();
   projDlg.addEventListener("click", (ev) => { if (ev.target === projDlg) projDlg.close(); });
-  const projWriteError = (e) => {
-    if (projFail(e)) return "";
+  const projWriteError = (e, sg) => {
+    if (projFail(e, sg)) return "";
     if (e && (e.code === "23514" || e.code === "22001")) return "Ein Feld ist ungültig oder zu lang. Name bis 80, Auftragsnummer bis 30, Verantwortlich bis 60, Notiz bis 1000 Zeichen; das Datum darf nicht in der Zukunft liegen.";
     if (e && e.code === "42501") return "Keine Berechtigung. Lade die Seite neu und versuche es noch einmal.";
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut speichern.";
@@ -1573,7 +1590,7 @@
         }
       }
     } catch (e) {
-      const m = projWriteError(e);
+      const m = projWriteError(e, sg);
       if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(titel, edit ? "gespeichert" : "angelegt", m), 7000);
     } finally { if (pg === projGen) $("projSave").disabled = false; }
   });
@@ -1605,7 +1622,7 @@
       afterProj();
       toast(`${da ? "Projekt" : `„${kurz(name, 40)}“`} gelöscht. Die Termine bleiben, nur ohne Projekt.`);
     } catch (e) {
-      const m = projWriteError(e);
+      const m = projWriteError(e, sg);
       if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
     }
   }));
@@ -1682,7 +1699,7 @@
       .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
         if (isLocked()) return;
         if (p.eventType === "DELETE") dropRow(p.old && p.old.id);
-        else if (p.new && p.new.id) putRow(p.new);
+        else if (p.new && p.new.id) { if (p.eventType === "INSERT") geloescht.delete(p.new.id); putRow(p.new); }
         afterChange();
         naechsteBald();
         progTermineBald(p);
@@ -1728,7 +1745,7 @@
     if (pchannel) { sb.removeChannel(pchannel); pchannel = null; }
     pjoined = false; pEpoch++; clearTimeout(pFirstT); clearTimeout(standT); projStand = null;
     if (projRaf) { cancelAnimationFrame(projRaf); projRaf = 0; }
-    loadSeq++; lastRangeKey = ""; joined = false; touched = new Set();
+    loadSeq++; lastRangeKey = ""; joined = false; touched = new Set(); geloescht = new Set();
     clearTimeout(navT); clearTimeout(retryT); clearTimeout(firstT); retryMs = 5000;
     if (dlg.open) dlg.close();
     if ($("teamDlg").open) $("teamDlg").close();
@@ -1761,15 +1778,21 @@
     loadNames();
     setTimeout(() => ($("loginName").value ? $("loginPw") : $("loginName")).focus(), 50);
   }
-  // Zählt gelungene Anmeldungen: ein Abmelden, dessen Antwort erst danach scheitert, löscht nicht die neue Sitzung
-  let anmeldOk = 0;
+  // Das laufende Abmelden: eine neue Anmeldung wartet darauf (siehe signIn). Sonst könnte sein Ergebnis oder eine noch
+  // laufende Token-Erneuerung des vorigen Kontos die neue Sitzung überschreiben oder löschen.
+  let abmelden = Promise.resolve();
   async function lockOut(msg) {
     loginStamp.set(0);
     showLogin(msg);
-    const nr = anmeldOk;
-    let failed = true;
-    try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
-    if (failed && nr === anmeldOk) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
+    const lauf = (async () => {
+      let failed = true;
+      try { failed = !!(await sb.auth.signOut({ scope: "local" })).error; } catch {}
+      // Ohne Antwort vom Server: die Sitzung trotzdem vom Gerät löschen (geteiltes Gerät)
+      if (failed) try { localStorage.removeItem(sb.auth.storageKey); } catch {}
+    })();
+    // Auch ein noch laufendes früheres Abmelden abwarten
+    abmelden = Promise.all([abmelden, lauf]);
+    await lauf;
   }
   // Nur Kalender-Konten: der Team-Zugang und die persönlichen Zugänge (Adressen ohne Postfach unter kalender.wattcon-installation.de)
   const kalUser = (s) => { const m = (s?.user?.email || "").toLowerCase(); return m === String(CFG.email).toLowerCase() || /^p-[0-9a-f]{12}@kalender\.wattcon-installation\.de$/.test(m); };
@@ -1828,7 +1851,8 @@
       .finally(() => clearTimeout(t));
   }
   let names = [], namesT = null, namesSeq = 0;
-  async function loadNames() {
+  // waehle: diesen Namen auswählen (z. B. gerade eingerichtet), sonst bleibt die bisherige Auswahl
+  async function loadNames(waehle) {
     clearTimeout(namesT);
     if (!sb) return;
     const seq = ++namesSeq;
@@ -1843,12 +1867,12 @@
     }
     if (/Namensliste/.test($("loginErr").textContent)) $("loginErr").textContent = "";
     names = r.data;
-    fillNames(names, true);
+    fillNames(names, true, waehle);
   }
   const optVal = (n) => n.team ? "team" : n.id;
   // Zur Auswahl stehen nur Personen mit eigenem Passwort und, solange es ihn gibt, der Team-Zugang
-  function fillNames(list, ok) {
-    const sel = $("loginName"), keep = sel.value || store.get("kal.loginName") || "";
+  function fillNames(list, ok, waehle) {
+    const sel = $("loginName"), keep = waehle || sel.value || store.get("kal.loginName") || "";
     sel.replaceChildren(...(list.length ? [el("option", { value: "" }, "Name wählen …"), ...list.map(n => el("option", { value: optVal(n) }, n.name))]
       : [el("option", { value: "" }, ok ? "Noch niemand eingerichtet" : "Keine Namen geladen")]));
     if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
@@ -1877,15 +1901,21 @@
 
   // Anmelden mit Adresse und Passwort, danach prüfen, ob das Konto in den Kalender darf
   async function signIn(email, pw) {
+    // Erst das vorige Abmelden zu Ende kommen lassen (hängt die Verbindung, höchstens 10 s; die Prüfung unten fängt den Rest ab)
+    await Promise.race([abmelden, new Promise(r => setTimeout(r, 10000))]);
     let error = null, data = null;
     try { ({ data, error } = await sb.auth.signInWithPassword({ email, password: pw })); } catch (e) { error = e; }
-    if (data?.session) anmeldOk++;
     if (error) return error;
     if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
     myEmail = data.session.user.email.toLowerCase();
     let me;
     try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
     if (!me.error && !me.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return null; }
+    // Gehört die gespeicherte Sitzung noch zu diesem Konto? Ein spätes Abmelden oder eine späte Token-Erneuerung des
+    // vorigen Kontos könnte sie gelöscht oder überschrieben haben: dann lieber noch einmal anmelden lassen
+    let jetzt = null;
+    try { jetzt = (await sb.auth.getSession()).data.session; } catch {}
+    if ((jetzt?.user?.email || "").toLowerCase() !== myEmail) { lockOut("Anmelden hat nicht geklappt. Bitte noch einmal anmelden."); return null; }
     state.me = me.error ? null : me.data;
     meAt = me.error ? 0 : Date.now();
     loginStamp.set(Date.now());
@@ -1941,10 +1971,14 @@
       out = await res.json().catch(() => null);
     } catch {}
     if (nr !== setupNr) {
-      // Inzwischen zurück zur Anmeldung oder neu begonnen: nichts überschreiben, nicht selbst anmelden. Nur sagen, dass es geklappt hat.
-      if (res && res.ok && out && out.ok && isLocked() && !$("loginForm").hidden) {
+      // Inzwischen zurück zur Anmeldung oder neu begonnen: nichts überschreiben, nicht selbst anmelden. Nur sagen, dass es
+      // geklappt hat (der Code ist damit verbraucht), und die Namensliste neu laden, damit der Name zur Auswahl steht.
+      if (res && res.ok && out && out.ok && isLocked()) {
         if (out.id) store.set("kal.loginName", String(out.id));
-        $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
+        // Den eigenen Namen gleich auswählen, außer es wird schon ein Passwort (für jemand anderen) eingetippt
+        loadNames(out.id && !$("loginPw").value ? String(out.id) : undefined);
+        if (!$("loginForm").hidden) $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
+        else $("setupErr").textContent = "Das zuerst eingegebene Passwort ist gespeichert, der Code ist damit verbraucht. Bitte „Zurück zur Anmeldung“ und damit anmelden.";
       }
       return;
     }
@@ -1961,7 +1995,7 @@
     let error;
     try { error = await signIn(out.email, pw); } finally { $("setupBtn").disabled = false; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
-    if (error) { showSetup(false); loadNames(); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
+    if (error) { showSetup(false); loadNames(out.id ? String(out.id) : undefined); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
     toast("Dein Passwort ist gespeichert");
   });
 
@@ -2262,7 +2296,13 @@
       return;
     }
     // Rückruf bleibt synchron: ein await auf sb.auth hier würde die Anmeldung blockieren.
-    sb.auth.onAuthStateChange((event) => { if (event === "SIGNED_OUT" && !document.body.classList.contains("locked")) showLogin("Bitte erneut anmelden."); });
+    sb.auth.onAuthStateChange((event, session) => {
+      if (event === "SIGNED_OUT" && !isLocked()) showLogin("Bitte erneut anmelden.");
+      // Gehört die Sitzung plötzlich einem anderen Konto (sehr späte Token-Erneuerung der vorigen Anmeldung, Anmeldung in
+      // einem anderen Tab): abmelden statt unter falschem Namen weiterzuarbeiten. Nicht im Rückruf selbst, der läuft unter der Sperre der Bibliothek.
+      else if (session && myEmail && !isLocked() && (session.user?.email || "").toLowerCase() !== myEmail)
+        setTimeout(() => { if (!isLocked()) lockOut("Bitte erneut anmelden."); });
+    });
     const { data } = await sb.auth.getSession();
     const stamp = loginStamp.get();
     if (data.session && !kalUser(data.session)) lockOut();
