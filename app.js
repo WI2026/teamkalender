@@ -125,6 +125,9 @@
   };
   // Schritte, die gerade geladen werden, und solche, die nach einem Fehler später erneut geladen werden
   const stepLaedt = new Set(), stepWarten = new Set();
+  // Zählt Abmeldungen: späte Antworten einer beendeten Anmeldung zeigen nichts mehr an
+  let sitzGen = 0;
+  const gleicheSitzung = (g) => g === sitzGen && !document.body.classList.contains("locked");
   let fertigMax = 100;  // so viele fertige Projekte zeigt die Liste (in Hunderterschritten mehr)
   // Zeitraum ist geladen, wenn ein bereits abgefragter Bereich ihn enthält.
   const covered = (ds) => state.ranges.some(r => ds >= r.from && ds <= r.to);
@@ -578,9 +581,21 @@
   let toastT = null;
   function toast(msg, ms) {
     const t = $("toast"); t.textContent = msg; t.hidden = false;
-    if (t.showPopover) { try { t.hidePopover(); } catch {} try { t.showPopover(); } catch {} }
+    zeigToast();
     clearTimeout(toastT); toastT = setTimeout(hideToast, ms || 2200);
   }
+  // Ist ein Fenster offen, gehört die Meldung hinein: alles außerhalb ist dann gesperrt und für Bildschirmleser stumm
+  function zeigToast() {
+    const t = $("toast"), oben = [...document.querySelectorAll("dialog[open]")].pop() || document.body;
+    if (t.parentNode !== oben) oben.append(t);
+    if (t.showPopover) { try { t.hidePopover(); } catch {} try { t.showPopover(); } catch {} }
+  }
+  // Schließt das Fenster, in dem die Meldung steht: im nächsten offenen Fenster oder auf der Seite weiter zeigen
+  document.querySelectorAll("dialog").forEach(d => d.addEventListener("close", () => {
+    const t = $("toast");
+    if (d.contains(t)) { if (!t.hidden && t.textContent) zeigToast(); else document.body.append(t); }
+  }));
+  const kurz = (x, n) => x.length > n ? x.slice(0, n - 1).trimEnd() + "…" : x;
   // Der Text kann einen Projektnamen enthalten: nach dem Ausblenden nicht im Dokument stehen lassen
   function hideToast() { clearTimeout(toastT); const t = $("toast"); t.hidden = true; t.textContent = ""; if (t.hidePopover) try { t.hidePopover(); } catch {} }
 
@@ -819,6 +834,8 @@
       // Stand der Datenbank übernehmen, dann die Live-Änderungen, die während der Abfrage kamen
       state.projekte = new Map(rows.map(r => [r.id, r]));
       state.schritteVon = new Set(open);
+      // Ältere Einzel-Ladevorgänge sind damit erledigt (ihre Antwort wird verworfen)
+      open.forEach(id => stepLaedt.delete(id));
       state.schritte = new Map(steps.map(r => [r.id, r]));
       for (const [id, r] of pt) { if (r) applyProjekt(r); else state.projekte.delete(id); }
       for (const id of state.schritteVon) if (!state.projekte.has(id)) state.schritteVon.delete(id);
@@ -868,7 +885,7 @@
     // Kurz nach einem Fehler nicht gleich wieder fragen, aber auch nicht aufgeben
     const warte = stepPause - (Date.now() - stepFailAt);
     if (warte > 0) { spaeterSchritte(need, warte); return; }
-    const seq = projSeq;
+    const seq = projSeq, sagen = progDlg.open && need.includes(progId) && stepWarten.has(progId);
     need.forEach(id => { state.schritteVon.add(id); stepLaedt.add(id); stepWarten.delete(id); });
     try {
       for (let i = 0; i < need.length; i += 100) {
@@ -878,12 +895,18 @@
         for (const r of part) if (sTouched.get(r.id) !== null) applySchritt(r);
       }
       stepPause = 0;
+      if (sagen && progDlg.open && need.includes(progId)) progSay("Schritte geladen.");
     } catch (e) {
       if (seq !== projSeq || projFail(e)) return;
       stepFailAt = Date.now(); stepPause = Math.min(stepPause ? stepPause * 2 : 15000, 120000);
       need.forEach(id => state.schritteVon.delete(id));
       spaeterSchritte(need, stepPause);
-    } finally { need.forEach(id => stepLaedt.delete(id)); }
+      if (progDlg.open && need.includes(progId)) progSay("Schritte konnten nicht geladen werden. Neuer Versuch läuft gleich von selbst.");
+    } finally {
+      need.forEach(id => stepLaedt.delete(id));
+      // Von einem vollständigen Neuladen überholt: trotzdem neu zeichnen (sonst bliebe „…“ stehen)
+      if (seq !== projSeq && !isLocked()) afterProjBald();
+    }
     afterProj();
   }
   // Nach einem Fehler später erneut laden (sonst bliebe „wird geladen“ stehen, bis zufällig etwas neu zeichnet)
@@ -961,9 +984,14 @@
       return;
     }
     const rest = list.length - zeige.length;
+    // Neu zeichnen (Live-Änderung, nachgeladene Schritte) behält den Tastaturfokus auf derselben Zeile
+    const act = document.activeElement, fokusPid = act && box.contains(act) ? act.dataset.pid : null;
     fill(box, el("ul", { class: "prows" }, zeige.map(p => el("li", null, projRow(p)))),
-      rest > 0 ? el("div", { class: "pmehr" }, el("button", { class: "btn", type: "button", onclick: () => { fertigMax += 100; renderProjekte(); } },
+      rest > 0 ? el("div", { class: "pmehr" }, el("button", { class: "btn", type: "button", onclick: () => {
+        // Fokus auf die erste neu gezeigte Zeile (der Knopf verschwindet beim Neuzeichnen)
+        const alt = fertigMax; fertigMax += 100; renderProjekte(); $("projList").querySelectorAll(".prow")[alt]?.focus(); } },
         `Weitere ${Math.min(rest, 100)} von ${rest} anzeigen`)) : null);
+    if (fokusPid) box.querySelector(`.prow[data-pid="${CSS.escape(fokusPid)}"]`)?.focus({ preventScroll: true });
   }
   function projRow(p) {
     const f = fortschritt(p.id), nx = state.naechste.get(p.id);
@@ -995,7 +1023,7 @@
     $("progBody").replaceChildren(
       el("header", { class: "phead", id: "progHead" }),
       el("div", { class: "pscroll", id: "progScroll" },
-        el("div", { class: "pstand", id: "progStand" }),
+        el("div", { class: "pstand", id: "progStand", tabindex: "-1" }),
         el("ul", { class: "psteps", id: "progSteps", "aria-label": "Schritte" }),
         el("form", { class: "padd", id: "progAdd", novalidate: true, hidden: true, onsubmit: (ev) => { ev.preventDefault(); addStep(); } },
           el("label", { class: "sr", for: "progNeu" }, "Neuer Schritt"),
@@ -1005,6 +1033,7 @@
           el("p", { class: "phinw", id: "progAddHint" })),
         el("div", { class: "err", id: "progErr", role: "alert" }),
         el("p", { class: "pinfo", id: "progInfo", role: "status" }),
+        el("p", { class: "sr", id: "progSay", role: "status" }),
         el("section", { class: "pnote", id: "progNote" }),
         el("section", { class: "ptermine", id: "progTermine" })),
       el("footer", { class: "pfoot", id: "progFoot" }));
@@ -1014,6 +1043,8 @@
     ensureSchritte([id]);
     loadProgTermine();
   }
+  // Nur für Bildschirmleser: Laden der Schritte geklappt oder nicht
+  function progSay(msg) { const n = $("progSay"); if (!n) return; n.textContent = ""; setTimeout(() => { if ($("progSay")) $("progSay").textContent = msg; }, 50); }
   // Kurze Rückmeldung im Fenster selbst (eine Meldung unten am Bildschirm läge hinter dem Fenster)
   let progInfoT = null;
   function progInfo(msg) {
@@ -1069,7 +1100,7 @@
       el("div", { class: "pzahl" }, el("strong", { class: "num" }, !f.loaded ? "…" : f.total ? `${f.done} von ${f.total}` : "0"),
         el("span", null, f.loaded && f.total ? "Schritten erledigt" : f.loaded ? "Noch keine Schritte" : fehl ? "Schritte konnten nicht geladen werden" : "Schritte werden geladen")),
       fehl ? el("div", { class: "pfehl" }, el("span", null, "Neuer Versuch läuft gleich von selbst."),
-        el("button", { class: "btn small", type: "button", onclick: () => { stepFailAt = 0; ensureSchritte([p.id]); renderProg(); } }, "Jetzt erneut versuchen")) : null,
+        el("button", { class: "btn small", type: "button", onclick: () => { stepFailAt = 0; ensureSchritte([p.id]); renderProg(); $("progStand")?.focus({ preventScroll: true }); } }, "Jetzt erneut versuchen")) : null,
       pbar(f, "big"),
       f.loaded && f.next ? el("p", { class: "pnext2" }, el("span", { class: "k" }, "Als Nächstes"), el("span", null, f.next.titel), offen(p) && f.seit != null ? el("span", { class: "seit" }, tageText(f.seit)) : null) : null,
       f.loaded && f.total && !f.next && offen(p) && !ro
@@ -1182,11 +1213,11 @@
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut versuchen.";
     return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
   };
-  // Fehler zu einem Projekt: im Fenster, solange es dieses Projekt zeigt, sonst unten am Bildschirm
-  // (sonst bliebe z. B. ein zurückgenommenes Häkchen nach dem Schließen unbemerkt)
-  function projMeldung(pid, m, sonst) {
-    if (!m) return;
-    if (progDlg.open && progId === pid && $("progErr")) $("progErr").textContent = m;
+  // Fehler zu einem Projekt: im Fenster, solange es dieses Projekt zeigt; zeigt es ein anderes, dort mit Namen; sonst unten am Bildschirm
+  // (sonst bliebe z. B. ein zurückgenommenes Häkchen nach dem Schließen unbemerkt). Nach dem Abmelden nichts mehr.
+  function projMeldung(pid, m, sonst, sg) {
+    if (!m || !gleicheSitzung(sg)) return;
+    if (progDlg.open && $("progErr")) $("progErr").textContent = progId === pid ? m : sonst || m;
     else toast(sonst || m, 7000);
   }
   // Abhaken: sofort anzeigen, bei Fehler zurücknehmen. „Wer und wann“ trägt die Datenbank ein.
@@ -1194,8 +1225,8 @@
     const prev = state.schritte.get(sid);
     if (!prev || !state.canWrite || stepBusy.has(sid)) return;
     stepBusy.add(sid); $("progErr").textContent = "";
-    const pid = prev.projekt_id, wer = state.projekte.get(pid)?.titel || "";
-    const nicht = `„${prev.titel}“${wer ? " bei " + wer : ""} wurde nicht ${on ? "abgehakt" : "wieder geöffnet"}. Bitte noch einmal versuchen.`;
+    const pid = prev.projekt_id, wer = state.projekte.get(pid)?.titel || "", sg = sitzGen;
+    const nicht = `„${kurz(prev.titel, 40)}“${wer ? " bei " + kurz(wer, 40) : ""} wurde nicht ${on ? "abgehakt" : "wieder geöffnet"}. Bitte noch einmal versuchen.`;
     // Vorläufige Anzeige behält den alten Zeitstempel: jede Antwort der Datenbank ist neuer und ersetzt sie
     const opt = { ...prev, erledigt: on, erledigt_am: on ? new Date().toISOString() : null, erledigt_von: on ? (state.me && state.me.name) || "" : null };
     state.schritte.set(sid, opt);
@@ -1211,17 +1242,17 @@
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked()) return;
         if (now.error) throw now.error;
-        if (now.data) { putSchritt(now.data); projMeldung(pid, "Speichern hat nicht geklappt. Bitte erneut versuchen.", nicht); }
+        if (now.data) { putSchritt(now.data); projMeldung(pid, "Speichern hat nicht geklappt. Bitte erneut versuchen.", nicht, sg); }
         else { dropSchritt(sid); if (progDlg.open && progId === pid) progInfo("Diesen Schritt hat gerade jemand gestrichen."); }
       }
     } catch (e) {
       if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
-      projMeldung(pid, stepError(e), nicht);
+      projMeldung(pid, stepError(e), nicht, sg);
     } finally { stepBusy.delete(sid); afterProj(); }
   }
   let addBusy = false;
   async function addStep() {
-    const inp = $("progNeu"), titel = inp.value.replace(/\s+/g, " ").trim(), pid = progId, gen = progGen;
+    const inp = $("progNeu"), titel = inp.value.replace(/\s+/g, " ").trim(), pid = progId, gen = progGen, sg = sitzGen;
     if (!titel || addBusy || !state.canWrite) return;
     addBusy = true; $("progErr").textContent = "";
     try {
@@ -1230,11 +1261,12 @@
       check(res);
       putSchritt(res.data);
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
-    } catch (e) { const m = stepError(e); if (m && gen === progGen && progDlg.open) $("progErr").textContent = m; else if (m) toast(`Der Schritt „${titel}“ wurde nicht hinzugefügt. Bitte noch einmal versuchen.`, 7000); }
+    } catch (e) { projMeldung(gen === progGen ? pid : null, stepError(e), `Der Schritt „${kurz(titel, 40)}“ wurde nicht hinzugefügt. Bitte noch einmal versuchen.`, sg); }
     finally { addBusy = false; afterProj(); }
   }
   async function delStep(sid) {
     $("progErr").textContent = "";
+    const pid = progId, sg = sitzGen;
     // Nach dem Streichen den Fokus auf den nächsten Schritt setzen (sonst landet er bei Tastatur und VoiceOver im Nichts)
     const list = stepsOf(progId), i = list.findIndex(x => x.id === sid), nb = (list[i + 1] || list[i - 1] || {}).id;
     try {
@@ -1245,10 +1277,10 @@
         // Gerade von jemand anderem abgehakt (erledigte streichen nur Verwalter) oder schon weg
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked()) return;
-        if (now.data) { putSchritt(now.data); if (progDlg.open) $("progErr").textContent = "Erledigte Schritte können nur Verwalter streichen."; }
+        if (now.data) { putSchritt(now.data); projMeldung(pid, "Erledigte Schritte können nur Verwalter streichen.", null, sg); }
         else if (!now.error) dropSchritt(sid);
       }
-    } catch (e) { const m = stepError(e); if (m && progDlg.open) $("progErr").textContent = m; }
+    } catch (e) { projMeldung(pid, stepError(e), "Ein Schritt wurde nicht gestrichen. Bitte noch einmal versuchen.", sg); }
     afterProj();
     if (progDlg.open && !progDlg.contains(document.activeElement)) {
       const row = nb && $("progSteps").querySelector(`[data-sid="${CSS.escape(nb)}"]`);
@@ -1257,13 +1289,14 @@
   }
   // Stand ändern (Als fertig markieren) mit Versionsprüfung
   async function setProjStand(p, status, btn) {
+    const sg = sitzGen;
     if (btn) btn.disabled = true;
     try {
       const res = await sb.from(PT).update({ status }).eq("id", p.id).eq("updated_at", p.updated_at).select(PCOLS);
       check(res);
       if (res.data.length) { putProjekt(res.data[0]); if (progDlg.open && progId === p.id) progInfo(status === "abgeschlossen" ? "Projekt ist fertig." : "Gespeichert."); }
-      else { projMeldung(p.id, "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen."); await reloadProjekt(p.id); }
-    } catch (e) { projMeldung(p.id, stepError(e), `„${p.titel}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`); }
+      else { projMeldung(p.id, "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen.", `„${kurz(p.titel, 40)}“ hat gerade jemand geändert. Bitte noch einmal prüfen.`, sg); await reloadProjekt(p.id); }
+    } catch (e) { projMeldung(p.id, stepError(e), `„${kurz(p.titel, 40)}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`, sg); }
     finally { if (btn) btn.disabled = false; afterProj(); }
   }
   async function reloadProjekt(id) {
@@ -1282,9 +1315,10 @@
     const op = progOpener; progOpener = null;
     if (id && !isLocked() && (!document.activeElement || document.activeElement === document.body)) {
       const sicht = (n) => !!n && n.isConnected && n.getClientRects().length > 0;
-      const q = op && op.dataset.tid ? `.ppill[data-pid="${CSS.escape(id)}"][data-tid="${CSS.escape(op.dataset.tid)}"]`
-        : `.prow[data-pid="${CSS.escape(id)}"], .ppill[data-pid="${CSS.escape(id)}"]`;
-      (sicht(op) ? op : [...document.querySelectorAll(q)].find(sicht))?.focus({ preventScroll: true });
+      const erst = (q) => [...document.querySelectorAll(q)].find(sicht);
+      // Zuerst dieselbe Projektzeile am selben Termin, sonst irgendeine sichtbare Zeile des Projekts (z. B. nach Sprung zu einem anderen Tag)
+      (sicht(op) ? op : (op && op.dataset.tid && erst(`.ppill[data-pid="${CSS.escape(id)}"][data-tid="${CSS.escape(op.dataset.tid)}"]`))
+        || erst(`.prow[data-pid="${CSS.escape(id)}"], .ppill[data-pid="${CSS.escape(id)}"]`))?.focus({ preventScroll: true });
     }
   });
   progDlg.addEventListener("click", (ev) => { if (ev.target === progDlg) progDlg.close(); });
@@ -1378,6 +1412,8 @@
       : datum > ymd(addDays(new Date(), 1)) ? "Das Datum der Unterschrift darf nicht in der Zukunft liegen." : datum < "2000-01-01" ? "Bitte das Datum der Unterschrift prüfen."
       : !edit && !$("p-sign").checked ? "Projekte gibt es nur für unterschriebene Aufträge. Bitte bestätigen, dass die Unterschrift vorliegt." : "";
     if (err) { $("projErr").textContent = err; return; }
+    // Vor dem ersten Warten merken, aus welchem Termin das Formular kam: wird er geschlossen oder ein anderer geöffnet, kommt nichts hinein
+    const sg = sitzGen, g0 = dlgGen, ausTermin = projForEditor && dlg.open, termNoch = () => ausTermin && dlg.open && g0 === dlgGen;
     $("projSave").disabled = true; $("projErr").textContent = "";
     try {
       if (edit) {
@@ -1394,10 +1430,10 @@
           return;
         }
         putProjekt(res.data[0]);
+        if (!gleicheSitzung(sg)) return;
         // Aus dem Termin angelegt (nach verlorener Antwort hier weitergeführt): Projekt im Termin auswählen
-        const imTermin = projForEditor && dlg.open;
         projDlg.close(); afterProj();
-        if (imTermin) { fillProjSelect(edit); $("f-projekt").focus(); }
+        if (termNoch()) { fillProjSelect(edit); $("f-projekt").focus(); }
         if (progDlg.open) progInfo("Projekt gespeichert."); else toast("Projekt gespeichert");
       } else {
         const id = projNeuId;
@@ -1407,7 +1443,7 @@
         if (res.error && res.error.code !== "23505") throw res.error;
         // Gleich nachladen, nicht auf die Live-Verbindung warten
         const one = await sb.from(PT).select(PCOLS).eq("id", id).maybeSingle();
-        if (isLocked()) return;
+        if (!gleicheSitzung(sg)) return;
         if (one.data) putProjekt(one.data);
         const d = one.data;
         if (res.error && !d) {
@@ -1427,16 +1463,15 @@
           $("projErr").textContent = "Das Projekt war beim ersten Versuch schon angelegt. „Speichern“ übernimmt deine Änderungen, die Schritte passt du danach unter „Schritte bearbeiten“ an.";
           return;
         }
-        const forEditor = projForEditor && dlg.open, g = dlgGen;
         projDlg.close();
         if (one.data) await ensureSchritte([id]);
-        if (isLocked()) return;
+        if (!gleicheSitzung(sg)) return;
         // Termin inzwischen geschlossen (oder ein anderer offen): nichts mehr hineinschreiben
-        if (forEditor && dlg.open && g === dlgGen) {
+        if (termNoch()) {
           fillProjSelect(id);
           if (!$("f-title").value.trim()) $("f-title").value = titel.slice(0, 120);
           $("f-projekt").focus();
-        } else if (forEditor) toast("Projekt angelegt");
+        } else if (ausTermin) toast("Projekt angelegt");
         else {
           state.pfilter.status = "laufend"; render();
           // Gleich die Checkliste zeigen
@@ -1588,7 +1623,7 @@
     if (progDlg.open) progDlg.close();
     if (projDlg.open) projDlg.close();
     // Formulare und Unterfenster immer leeren, auch wenn sie gerade zu sind (späte Antworten, vom Browser wiederhergestellte Eingaben)
-    wipeTermin(); wipeProjForm(); $("progBody").replaceChildren(); progOpener = null; hideToast();
+    sitzGen++; wipeTermin(); wipeProjForm(); $("progBody").replaceChildren(); progOpener = null; hideToast();
     projSeq++; naechsteSeq++; clearTimeout(projRetryT); clearTimeout(naechsteT); stepFailAt = 0; stepPause = 0;
     clearTimeout(stepRetryT); stepRetryT = 0; stepWarten.clear(); stepLaedt.clear(); fertigMax = 100;
     pTouched = new Map(); sTouched = new Map(); stepBusy.clear(); wantSet.clear(); clearTimeout(wantT); wantT = 0; disarmDel();

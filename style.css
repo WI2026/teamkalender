@@ -772,3 +772,8 @@ body.locked .app { display: none; }
 
 /* Meldung in der obersten Ebene (über offenen Fenstern) */
 .toast[popover] { inset: auto auto calc(env(safe-area-inset-bottom, 0px) + 20px) 50%; margin: 0; border: 0; overflow: visible; width: max-content; height: auto; }
+/* Lange Namen umbrechen; mehrzeilig ein abgerundetes Rechteck statt einer Pille. Tipps gehen durch die Meldung hindurch. */
+.toast { overflow-wrap: anywhere; border-radius: 20px; pointer-events: none; }
+/* In einem offenen Fenster oben, damit dessen Knöpfe unten frei bleiben */
+dialog > .toast[popover] { inset: calc(env(safe-area-inset-top, 0px) + 12px) auto auto 50%; }
+dialog > .toast[hidden] { transform: translate(-50%, -12px); }
