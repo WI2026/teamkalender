@@ -1684,6 +1684,8 @@
         let q = sb.from(T).select(COLS).gte("date", ymd(first)).order("date").order("id").limit(PAGE);
         if (last) q = q.or(`date.gt.${last.date},and(date.eq.${last.date},id.gt.${last.id})`);
         const { data, error } = await q;
+        // Abgemeldet oder Konto gewechselt: nicht weiterblättern
+        if (!gleicheSitzung(sg)) return;
         if (error) throw error;
         for (const r of data) got.set(r.id, r);
         if (data.length < PAGE) break;
