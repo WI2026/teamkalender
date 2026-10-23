@@ -990,13 +990,15 @@
     }
     const rest = list.length - zeige.length;
     // Neu zeichnen (Live-Änderung, nachgeladene Schritte) behält den Tastaturfokus auf derselben Zeile
-    const act = document.activeElement, fokusPid = act && box.contains(act) ? act.dataset.pid : null;
+    const act = document.activeElement, fokusPid = act && box.contains(act) ? act.dataset.pid : null, y = scrollY;
     fill(box, el("ul", { class: "prows" }, zeige.map(p => el("li", null, projRow(p)))),
       rest > 0 ? el("div", { class: "pmehr" }, el("button", { class: "btn", type: "button", onclick: () => {
         // Fokus auf die erste neu gezeigte Zeile (der Knopf verschwindet beim Neuzeichnen)
         const alt = fertigMax; fertigMax += 100; renderProjekte(); $("projList").querySelectorAll(".prow")[alt]?.focus(); } },
         `Weitere ${Math.min(rest, 100)} von ${rest} anzeigen`)) : null);
     if (fokusPid) box.querySelector(`.prow[data-pid="${CSS.escape(fokusPid)}"]`)?.focus({ preventScroll: true });
+    // Wie im Blatt: das Entfernen der fokussierten Zeile darf die Seite nicht verschieben
+    if (fokusPid && scrollY !== y) scrollTo(scrollX, y);
   }
   function projRow(p) {
     const f = fortschritt(p.id), nx = state.naechste.get(p.id);
@@ -1096,6 +1098,8 @@
     if (f.loaded && $("progSay")?.dataset.fehl) progSay("Schritte geladen.");
     const act = document.activeElement, focusSid = act && act.closest && act.closest("#progSteps [data-sid]")?.dataset.sid;
     const focusCls = act && act.classList ? [...act.classList].find(c => c === "reopen" || c === "sdel") || "" : "";
+    // Rollstand merken: Chromium kürzt ihn, wenn beim Ersetzen der Zeilen die fokussierte entfernt wird (das Blatt spränge nach oben)
+    const sc = $("progScroll"), top = sc ? sc.scrollTop : 0;
     fill($("progHead"),
       el("span", { class: "grab", "aria-hidden": "true" }),
       el("div", { class: "ph" },
@@ -1154,6 +1158,7 @@
       const row = $("progSteps").querySelector(`[data-sid="${CSS.escape(focusSid)}"]`);
       (focusCls && row?.querySelector("." + focusCls) || row?.querySelector("input"))?.focus({ preventScroll: true });
     }
+    if (sc && sc.scrollTop !== top) sc.scrollTop = top;
   }
   function renderProgTermine() {
     const box = $("progTermine");
@@ -1221,15 +1226,19 @@
     if (e && e.code === "23503") { if (progId) reloadProjekt(progId); return "Dieses Projekt gibt es nicht mehr."; }
     if (e && e.code === "42501") return "Keine Berechtigung. Lade die Seite neu und versuche es noch einmal.";
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut versuchen.";
-    return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
+    return STEP_ALLG;
   };
+  const STEP_ALLG = "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
   // Fehler zu einem Projekt: im Fenster unter der Liste, wenn es dieses Projekt zeigt und die Stelle gerade zu sehen ist;
   // sonst als Meldung oben (im offenen Fenster), bei einem anderen Projekt mit Namen. Sonst bliebe z. B. ein zurückgenommenes
   // Häkchen unbemerkt. Nach dem Abmelden nichts mehr.
   function projMeldung(pid, m, sonst, sg) {
     if (!m || !gleicheSitzung(sg)) return;
-    const hier = progDlg.open && progId === pid, e = hier && $("progErr");
+    // Liegt ein anderes Fenster darüber (z. B. „Projekt bearbeiten“), gilt das Blatt als nicht zu sehen
+    const hier = progDlg.open && progId === pid && [...document.querySelectorAll("dialog[open]")].pop() === progDlg, e = hier && $("progErr");
     if (e) {
+      // Zurückgenommenes Häkchen erst zeichnen: gemessen wird am Stand, den der Nutzer danach sieht
+      renderProg();
       // Erst schreiben, dann messen (leer ist das Feld ausgeblendet); im selben Schritt wieder leeren wird nicht angesagt.
       // Wer gerade im Feld „Neuer Schritt“ ist, bekommt die Meldung direkt darunter (ein kleines Stück weiterrollen)
       e.textContent = m;
@@ -1246,7 +1255,10 @@
     if (!prev || !state.canWrite || stepBusy.has(sid)) return;
     stepBusy.add(sid); $("progErr").textContent = "";
     const pid = prev.projekt_id, wer = state.projekte.get(pid)?.titel || "", sg = sitzGen;
-    const nicht = `„${kurz(prev.titel, 40)}“${wer ? " bei " + kurz(wer, 40) : ""} wurde nicht ${on ? "abgehakt" : "wieder geöffnet"}. Bitte noch einmal versuchen.`;
+    const was = `„${kurz(prev.titel, 40)}“`, wie = `wurde nicht ${on ? "abgehakt" : "wieder geöffnet"}.`;
+    const nicht = `${was}${wer ? " bei " + kurz(wer, 40) : ""} ${wie} Bitte noch einmal versuchen.`;
+    // Im Blatt dieses Projekts: der Schritt kann außer Sicht sein, also ihn nennen; einen besonderen Grund mit angeben
+    const hierText = (g) => g && `${was} ${wie} ${g === STEP_ALLG ? "Prüfe die Verbindung und versuche es erneut." : g}`;
     // Vorläufige Anzeige behält den alten Zeitstempel: jede Antwort der Datenbank ist neuer und ersetzt sie
     const opt = { ...prev, erledigt: on, erledigt_am: on ? new Date().toISOString() : null, erledigt_von: on ? (state.me && state.me.name) || "" : null };
     state.schritte.set(sid, opt);
@@ -1262,12 +1274,12 @@
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked()) return;
         if (now.error) throw now.error;
-        if (now.data) { putSchritt(now.data); projMeldung(pid, "Speichern hat nicht geklappt. Bitte erneut versuchen.", nicht, sg); }
+        if (now.data) { putSchritt(now.data); projMeldung(pid, `${was} ${wie} Bitte noch einmal versuchen.`, nicht, sg); }
         else { dropSchritt(sid); if (progDlg.open && progId === pid) progInfo("Diesen Schritt hat gerade jemand gestrichen."); }
       }
     } catch (e) {
       if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
-      projMeldung(pid, stepError(e), nicht, sg);
+      projMeldung(pid, hierText(stepError(e)), nicht, sg);
     } finally { stepBusy.delete(sid); afterProj(); }
   }
   let addBusy = false;
