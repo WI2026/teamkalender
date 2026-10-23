@@ -456,9 +456,9 @@
     const cat = e && CATS.some(c => c.id === e.cat) ? e.cat : "baustelle";
     $(`cat-${cat}`).checked = true;
     $("formErr").textContent = "";
-    $("delBtn").hidden = !e || ro;
+    $("delBtn").hidden = !e || ro; $("delBtn").disabled = false;
     disarmDelete();
-    $("saveBtn").hidden = ro;
+    $("saveBtn").hidden = ro; $("saveBtn").disabled = false;
     $("cancelBtn").textContent = ro ? "Schließen" : "Abbrechen";
     dlg.querySelectorAll("input, textarea, select").forEach(n => { n.disabled = ro; });
     $("stamp").textContent = e && e.updatedAt ? `Geändert ${fmtStamp(e.updatedAt)}` : "";
@@ -531,11 +531,19 @@
     }
     if (performance.now() - delAb < 500) return;
     disarmDelete();
-    const id = editingId;
+    // Vor dem Warten merken, welches Öffnen das war: ist inzwischen ein anderer Termin offen, bleibt der unberührt
+    const id = editingId, g = dlgGen, sg = sitzGen, name = state.events.get(id)?.title || $("f-title").value.trim() || "Termin";
+    const hier = () => g === dlgGen && dlg.open && gleicheSitzung(sg);
     b.disabled = true; deletingId = id;
-    try { await state.col.doc(id).delete(); dlg.close(); render(); toast("Termin gelöscht"); }
-    catch (err) { $("formErr").textContent = writeError(err); }
-    finally { b.disabled = false; deletingId = null; }
+    try {
+      await state.col.doc(id).delete();
+      if (hier()) { dlg.close(); toast("Termin gelöscht"); } else if (gleicheSitzung(sg)) toast(`„${kurz(name, 40)}“ gelöscht`);
+      render();
+    } catch (err) {
+      const h = hier(), m = writeError(err, h);
+      if (h) $("formErr").textContent = m === STEP_ALLG ? "Löschen hat nicht geklappt. Prüfe die Verbindung und versuche es erneut." : m;
+      else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
+    } finally { if (g === dlgGen) b.disabled = false; if (deletingId === id) deletingId = null; }
   });
 
   $("form").addEventListener("submit", async (ev) => {
@@ -556,32 +564,50 @@
       createdAt: prev?.createdAt || now, createdBy: prev?.createdBy || state.myId || "", updatedAt: now };
     // Projekt nur mitschicken, wenn es hier geändert wurde (sonst überschriebe ein veralteter Stand die Zuordnung)
     if (!editingId || $("f-projekt").value !== projektAtOpen) body.projektId = $("f-projekt").value || null;
+    // Vor dem Warten merken, welches Öffnen das war: eine späte Antwort schließt keinen inzwischen geöffneten anderen Termin
+    const g = dlgGen, sg = sitzGen, hier = () => g === dlgGen && dlg.open && gleicheSitzung(sg);
     $("saveBtn").disabled = true;
     try {
       if (editingId) await state.col.doc(editingId).set(body, editingStamp); else await state.col.add(body);
+      if (!hier()) {
+        // Fenster inzwischen zu oder ein anderer Termin offen: nur melden, die Ansicht nicht verschieben
+        render();
+        if (gleicheSitzung(sg)) toast(`„${kurz(title, 40)}“ ${prev ? "gespeichert" : "eingetragen"}`);
+        return;
+      }
       dlg.close();
       state.selected = date;
       const d = parse(date);
       if (state.view === "month" && (d.getMonth() !== state.cursor.getMonth() || d.getFullYear() !== state.cursor.getFullYear())) state.cursor = d;
       if (state.view === "week" && ymd(monday(d)) !== ymd(weekStart())) state.cursor = d;
       render();
-      if (!document.body.classList.contains("locked")) toast(prev ? "Termin gespeichert" : "Termin eingetragen");
-    } catch (e2) { $("formErr").textContent = writeError(e2); }
-    finally { $("saveBtn").disabled = false; }
+      toast(prev ? "Termin gespeichert" : "Termin eingetragen");
+    } catch (e2) {
+      const h = hier(), m = writeError(e2, h);
+      if (h) $("formErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(title, prev ? "gespeichert" : "eingetragen", m), 7000);
+    } finally { if (g === dlgGen) $("saveBtn").disabled = false; }
   });
 
-  function writeError(e) {
+  // hier: das Fenster zeigt noch den Termin, für den die Antwort kam. Sonst ändert die Meldung nichts im Formular
+  // und ist für eine kurze Meldung mit Namen gedacht (siehe nichtText).
+  function writeError(e, hier) {
     const code = e && e.code;
     if (code === "conflict") {
+      if (!hier) return "Jemand hat ihn gerade geändert. Bitte öffnen und noch einmal speichern.";
       editingStamp = state.events.get(editingId)?.updatedAt || null;
       return "Jemand hat diesen Termin gerade geändert. Abbrechen zeigt die neue Fassung, Speichern überschreibt sie mit deiner.";
     }
     if (loggedOut(e)) { lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden."); return ""; }
     if (code === "23514" || code === "22001") return "Ein Feld ist ungültig oder zu lang. Titel bis 120, Name bis 60, Notiz bis 1000 Zeichen.";
-    if (code === "23503") { $("f-projekt").value = ""; syncProgRow(); return "Das gewählte Projekt gibt es nicht mehr. Bitte ein anderes wählen oder ohne Projekt speichern."; }
+    if (code === "23503") {
+      if (!hier) return "Das gewählte Projekt gibt es nicht mehr.";
+      $("f-projekt").value = ""; syncProgRow(); return "Das gewählte Projekt gibt es nicht mehr. Bitte ein anderes wählen oder ohne Projekt speichern.";
+    }
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut speichern.";
-    return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
+    return STEP_ALLG;
   }
+  // Antwort für ein schon geschlossenes Fenster: sagen, welcher Eintrag gemeint ist
+  const nichtText = (name, tun, m) => `„${kurz(name, 40)}“ wurde nicht ${tun}. ${m === STEP_ALLG ? "Prüfe die Verbindung und versuche es erneut." : m}`;
   const loggedOut = (e) => !!e && (["42501", "PGRST301", "PGRST302", "PGRST303"].includes(e.code) || e.status === 401 || e.status === 403 || /JWT/i.test(e.message || ""));
 
   // ---------- Toast ----------
@@ -1366,6 +1392,8 @@
   // ---------- Projekt anlegen und bearbeiten ----------
   const projDlg = $("projDlg");
   let projEditId = null, projStamp = null, projForEditor = false, projNeuId = null;
+  // Zählt Öffnen und Schließen des Projektformulars: späte Antworten ändern nur das Formular, aus dem sie kamen
+  let projGen = 0;
   // Verwalter mit eigenem Zugang (dürfen Projekte und erledigte Schritte löschen; die Datenbank prüft das ebenso)
   const istVerwalter = () => !!(state.me && state.me.admin && !state.me.team);
   $("arten").replaceChildren(...ARTEN.map((a, i) => el("label", { style: "--c:var(--accent-ink)" },
@@ -1395,6 +1423,7 @@
     const p = id ? state.projekte.get(id) : null;
     if (id && !p) return;
     if (!state.canWrite) return;
+    projGen++;
     projEditId = id; projStamp = p ? p.updated_at : null; projForEditor = !!forEditor;
     // Neues Projekt: Kennung schon jetzt, damit ein zweiter Versuch nach Verbindungsabbruch kein zweites Projekt anlegt
     projNeuId = p ? null : crypto.randomUUID();
@@ -1417,7 +1446,7 @@
     if (p) $(`pst-${p.status in STAND ? p.status : "laufend"}`).checked = true;
     $("p-signRow").hidden = !!p; $("p-sign").checked = false;
     $("p-vorlage").open = false;
-    $("projSave").textContent = p ? "Speichern" : "Anlegen";
+    $("projSave").textContent = p ? "Speichern" : "Anlegen"; $("projSave").disabled = false;
     $("projDel").hidden = !p || !istVerwalter();
     disarm($("projDel"));
     $("projErr").textContent = "";
@@ -1431,7 +1460,7 @@
     $("projForm").reset(); $("projErr").textContent = ""; $("projStamp").textContent = ""; $("p-vorlageListe").replaceChildren(); $("p-werListe").replaceChildren();
     projEditId = projStamp = projNeuId = null; disarm($("projDel"));
   }
-  projDlg.addEventListener("close", () => { if (!projDlg.open) wipeProjForm(); });
+  projDlg.addEventListener("close", () => { if (projDlg.open) return; projGen++; wipeProjForm(); });
   // Vom Browser wiederhergestellte Eingaben (Zurück, wiederhergestellter Tab) gleich verwerfen
   $("form").reset(); $("projForm").reset();
   projDlg.addEventListener("click", (ev) => { if (ev.target === projDlg) projDlg.close(); });
@@ -1440,7 +1469,7 @@
     if (e && (e.code === "23514" || e.code === "22001")) return "Ein Feld ist ungültig oder zu lang. Name bis 80, Auftragsnummer bis 30, Verantwortlich bis 60, Notiz bis 1000 Zeichen; das Datum darf nicht in der Zukunft liegen.";
     if (e && e.code === "42501") return "Keine Berechtigung. Lade die Seite neu und versuche es noch einmal.";
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut speichern.";
-    return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
+    return STEP_ALLG;
   };
   $("projForm").addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -1454,6 +1483,8 @@
     if (err) { $("projErr").textContent = err; return; }
     // Vor dem ersten Warten merken, aus welchem Termin das Formular kam: wird er geschlossen oder ein anderer geöffnet, kommt nichts hinein
     const sg = sitzGen, g0 = dlgGen, ausTermin = projForEditor && dlg.open, termNoch = () => ausTermin && dlg.open && g0 === dlgGen;
+    // Ebenso fürs Formular selbst: ist es zu oder schon für ein anderes Projekt offen, geht die Antwort als kurze Meldung mit Namen
+    const pg = projGen, hier = () => pg === projGen && projDlg.open && gleicheSitzung(sg);
     $("projSave").disabled = true; $("projErr").textContent = "";
     try {
       if (edit) {
@@ -1464,17 +1495,21 @@
         check(res);
         if (!res.data.length) {
           await reloadProjekt(edit);
-          if (!state.projekte.has(edit)) { $("projErr").textContent = "Dieses Projekt wurde gerade gelöscht."; return; }
+          if (!gleicheSitzung(sg)) return;
+          const weg = !state.projekte.has(edit);
+          if (!hier()) { toast(nichtText(titel, "gespeichert", weg ? "Es wurde gerade gelöscht." : "Jemand hat es gerade geändert. Bitte öffnen und noch einmal speichern."), 7000); return; }
+          if (weg) { $("projErr").textContent = "Dieses Projekt wurde gerade gelöscht."; return; }
           projStamp = state.projekte.get(edit).updated_at;
           $("projErr").textContent = "Jemand hat dieses Projekt gerade geändert. Abbrechen zeigt die neue Fassung, Speichern überschreibt sie mit deiner.";
           return;
         }
         putProjekt(res.data[0]);
         if (!gleicheSitzung(sg)) return;
+        if (!hier()) { afterProj(); toast(`„${kurz(titel, 40)}“ gespeichert`); return; }
         // Aus dem Termin angelegt (nach verlorener Antwort hier weitergeführt): Projekt im Termin auswählen
         projDlg.close(); afterProj();
         if (termNoch()) { fillProjSelect(edit); $("f-projekt").focus(); }
-        if (progDlg.open) progInfo("Projekt gespeichert."); else toast("Projekt gespeichert");
+        if (progDlg.open && progId === edit) progInfo("Projekt gespeichert."); else toast("Projekt gespeichert");
       } else {
         const id = projNeuId;
         const res = await sb.rpc("kalender_projekt_anlegen", { p_id: id, p_titel: titel, p_art: art, p_unterschrieben_am: datum, p_auftragsnr: nr,
@@ -1489,11 +1524,13 @@
         if (res.error && !d) {
           // Nicht bestätigt, dass das Projekt da ist: Fenster offen lassen. Ist es inzwischen gelöscht, legt der nächste Versuch es neu an.
           if (one.error) throw one.error;
-          projNeuId = crypto.randomUUID();
+          if (hier()) projNeuId = crypto.randomUUID();
           throw res.error;
         }
         if (res.error && !(d.titel === titel && d.art === art && d.unterschrieben_am === datum && (d.auftragsnr || "") === nr
             && (d.verantwortlich || "") === wer && (d.notiz || "") === notiz)) {
+          // Formular inzwischen zu oder ein anderes offen: das fremde Formular nicht umbauen, nur Bescheid geben
+          if (!hier()) { afterProj(); toast(`„${kurz(titel, 40)}“ war schon angelegt. Deine letzten Änderungen daran sind nicht gespeichert, bitte im Projekt nachtragen.`, 7000); return; }
           // Dazwischen wurde etwas geändert: nicht stillschweigend verwerfen, sondern als Bearbeiten weiterführen
           projEditId = id; projStamp = d.updated_at; projNeuId = null;
           $("projDlgTitle").textContent = "Projekt bearbeiten"; $("projSave").textContent = "Speichern";
@@ -1503,9 +1540,12 @@
           $("projErr").textContent = "Das Projekt war beim ersten Versuch schon angelegt. „Speichern“ übernimmt deine Änderungen, die Schritte passt du danach unter „Schritte bearbeiten“ an.";
           return;
         }
-        projDlg.close();
+        const da = hier();
+        if (da) projDlg.close();
         if (one.data) await ensureSchritte([id]);
         if (!gleicheSitzung(sg)) return;
+        // Formular inzwischen zu (Abbrechen) oder ein anderes offen: kein Fenster öffnen, nichts in den Termin schreiben
+        if (!da) { afterProj(); toast(`„${kurz(titel, 40)}“ angelegt`); return; }
         // Termin inzwischen geschlossen (oder ein anderer offen): nichts mehr hineinschreiben
         if (termNoch()) {
           fillProjSelect(id);
@@ -1518,12 +1558,16 @@
           if (state.projekte.has(id)) { openProg(id); progInfo("Projekt angelegt."); } else toast("Projekt angelegt");
         }
       }
-    } catch (e) { const m = projWriteError(e); if (m && projDlg.open) $("projErr").textContent = m; }
-    finally { $("projSave").disabled = false; }
+    } catch (e) {
+      const m = projWriteError(e);
+      if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(titel, edit ? "gespeichert" : "angelegt", m), 7000);
+    } finally { if (pg === projGen) $("projSave").disabled = false; }
   });
   $("projDel").addEventListener("click", (ev) => confirmClick(ev.currentTarget, "Mit Checkliste löschen?", async () => {
     const id = projEditId;
     if (!id) return;
+    const sg = sitzGen, pg = projGen, hier = () => pg === projGen && projDlg.open && gleicheSitzung(sg);
+    const name = state.projekte.get(id)?.titel || $("p-titel").value.trim() || "Projekt";
     $("projErr").textContent = "";
     try {
       const res = await sb.from(PT).delete().eq("id", id).select("id");
@@ -1531,13 +1575,25 @@
       if (!res.data.length) {
         // Schon weg oder kein Verwalter
         await reloadProjekt(id);
-        if (state.projekte.has(id)) { $("projErr").textContent = "Löschen dürfen nur Verwalter mit eigenem Zugang."; return; }
+        if (!gleicheSitzung(sg)) return;
+        if (state.projekte.has(id)) {
+          const m = "Löschen dürfen nur Verwalter mit eigenem Zugang.";
+          if (hier()) $("projErr").textContent = m; else toast(nichtText(name, "gelöscht", m), 7000);
+          return;
+        }
       }
+      if (!gleicheSitzung(sg)) return;
       dropProjekt(id);
-      projDlg.close(); if (progDlg.open) progDlg.close();
+      const da = hier();
+      if (da) projDlg.close();
+      // Nur das Unterfenster dieses Projekts schließen, ein inzwischen geöffnetes anderes bleibt
+      if (progDlg.open && progId === id) progDlg.close();
       afterProj();
-      toast("Projekt gelöscht. Die Termine bleiben, nur ohne Projekt.");
-    } catch (e) { const m = projWriteError(e); if (m && projDlg.open) $("projErr").textContent = m; }
+      toast(`${da ? "Projekt" : `„${kurz(name, 40)}“`} gelöscht. Die Termine bleiben, nur ohne Projekt.`);
+    } catch (e) {
+      const m = projWriteError(e);
+      if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
+    }
   }));
 
   // ---------- PDF ----------
@@ -2108,7 +2164,8 @@
       logLast = rows.length ? rows[rows.length - 1] : logLast;
       $("logMore").hidden = rows.length < 100;
     } catch (e) { if (gen === logGen) logFail(e); }
-    finally { logBusy = false; $("logMore").disabled = false; }
+    // Inzwischen neu geöffnet: Knöpfe und Sperre gehören dem neuen Öffnen
+    finally { if (gen === logGen) { logBusy = false; $("logMore").disabled = false; } }
   }
   // Als Tabelle (CSV, öffnet in Excel): alle Einträge, neueste zuerst
   const zelle = (v) => { let s = String(v ?? ""); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
@@ -2134,10 +2191,12 @@
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       toast("Protokoll wird gespeichert. Vertraulich, enthält Kundendaten.");
     } catch (e) { if (gen === logGen) logFail(e); }
-    finally { logBusy = false; $("logCsv").disabled = false; }
+    finally { if (gen === logGen) { logBusy = false; $("logCsv").disabled = false; } }
   }
   $("logBtn").addEventListener("click", () => {
-    logGen++; logLast = null; $("logList").replaceChildren(); $("logErr").textContent = ""; $("logMore").hidden = true;
+    // Läuft noch eine Ladung des vorigen Öffnens, wird sie verworfen: hier gleich neu laden
+    logGen++; logBusy = false; logLast = null; $("logList").replaceChildren(); $("logErr").textContent = ""; $("logMore").hidden = true;
+    $("logMore").disabled = false; $("logCsv").disabled = false;
     oeffne(logDlg); loadLog(false);
   });
   $("logMore").addEventListener("click", () => loadLog(true));
