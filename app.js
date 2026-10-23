@@ -729,23 +729,27 @@
     render();
   }
   state.col = {
-    add: async (b) => { const res = await sb.from(T).insert(toRow(b)).select(COLS).single(); check(res); putRow(res.data); },
+    // Antworten, die erst nach einem Ab- und Anmelden kommen, gehören zur vorigen Anmeldung: nichts mehr übernehmen
+    // (sonst käme z. B. ein inzwischen gelöschter Termin zurück; die neue Anmeldung lädt selbst)
+    add: async (b) => { const sg = sitzGen, res = await sb.from(T).insert(toRow(b)).select(COLS).single(); check(res); if (sg === sitzGen) putRow(res.data); },
     doc: (id) => ({
       // Nur speichern, wenn niemand den Termin seit dem Öffnen geändert hat.
       set: async (b, stamp) => {
+        const sg = sitzGen;
         let q = sb.from(T).update(toRow(b)).eq("id", id);
         if (stamp) q = q.eq("updated_at", stamp);
         const res = await q.select(COLS); check(res);
+        if (sg !== sitzGen) return;
         // Gespeichert, aber inzwischen gelöscht (Live-Nachricht kam vor dieser Antwort): wie eine Löschung behandeln
         if (res.data.length && geloescht.has(id)) { afterChange(); throw { code: "conflict" }; }
         if (res.data.length) { putRow(res.data[0]); return; }
         const now = await sb.from(T).select(COLS).eq("id", id).maybeSingle(); check(now);
-        if (isLocked()) throw { code: "conflict" };
+        if (isLocked() || sg !== sitzGen) throw { code: "conflict" };
         if (now.data) putRow(now.data); else dropRow(id);
         afterChange();
         throw { code: "conflict" };
       },
-      delete: async () => { check(await sb.from(T).delete().eq("id", id)); dropRow(id); },
+      delete: async () => { const sg = sitzGen; check(await sb.from(T).delete().eq("id", id)); if (sg === sitzGen) dropRow(id); },
     }),
   };
   // Geladen wird nur der sichtbare Zeitraum, damit die Datenmenge auch nach Jahren klein bleibt.
@@ -1323,13 +1327,14 @@
     try {
       const res = await sb.from(ST).update({ erledigt: on }).eq("id", sid).select(SCOLS);
       check(res);
+      if (sg !== sitzGen) return;
       if (res.data.length) putSchritt(res.data[0]);
       else {
         // Nichts geändert: entweder gestrichen oder der Zugang gilt nicht mehr
         if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
         if (await checkMe() === "weg") return;
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
-        if (isLocked()) return;
+        if (isLocked() || sg !== sitzGen) return;
         if (now.error) throw now.error;
         if (now.data) { putSchritt(now.data); projMeldung(pid, `${was} ${wie} Bitte noch einmal versuchen.`, nicht, sg); }
         else { dropSchritt(sid); if (progDlg.open && progId === pid) progInfo("Diesen Schritt hat gerade jemand gestrichen."); }
@@ -1351,6 +1356,7 @@
       const pos = neuePos(stepsOf(pid));
       const res = await sb.from(ST).insert(pos == null ? { projekt_id: pid, titel } : { projekt_id: pid, titel, pos }).select(SCOLS).single();
       check(res);
+      if (sg !== sitzGen) return;
       putSchritt(res.data);
       if (gen === progGen) { inp.value = ""; inp.focus({ preventScroll: true }); }
     } catch (e) {
@@ -1370,11 +1376,12 @@
     try {
       const res = await sb.from(ST).delete().eq("id", sid).select("id");
       check(res);
+      if (sg !== sitzGen) return;
       if (res.data.length) dropSchritt(sid);
       else {
         // Gerade von jemand anderem abgehakt (erledigte streichen nur Verwalter) oder schon weg
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
-        if (isLocked()) return;
+        if (isLocked() || sg !== sitzGen) return;
         if (now.data) { putSchritt(now.data); projMeldung(pid, "Erledigte Schritte können nur Verwalter streichen.", `${was} wurde nicht gestrichen: Erledigte Schritte können nur Verwalter streichen.`, sg); }
         else if (!now.error) dropSchritt(sid);
       }
@@ -1392,15 +1399,17 @@
     try {
       const res = await sb.from(PT).update({ status }).eq("id", p.id).eq("updated_at", p.updated_at).select(PCOLS);
       check(res);
+      if (sg !== sitzGen) return;
       if (res.data.length) { putProjekt(res.data[0]); if (progDlg.open && progId === p.id) progInfo(status === "abgeschlossen" ? "Projekt ist fertig." : "Gespeichert."); }
       else { projMeldung(p.id, "Jemand hat das Projekt gerade geändert. Bitte noch einmal prüfen.", `„${kurz(p.titel, 40)}“ hat gerade jemand geändert. Bitte noch einmal prüfen.`, sg); await reloadProjekt(p.id); }
     } catch (e) { projMeldung(p.id, stepError(e, p.id, sg), `„${kurz(p.titel, 40)}“ wurde nicht als fertig markiert. Bitte noch einmal versuchen.`, sg); }
     finally { if (btn) btn.disabled = false; afterProj(); }
   }
   async function reloadProjekt(id) {
+    const sg = sitzGen;
     let r;
     try { r = await sb.from(PT).select(PCOLS).eq("id", id).maybeSingle(); } catch { return; }
-    if (isLocked() || r.error) return;
+    if (isLocked() || r.error || sg !== sitzGen) return;
     if (r.data) putProjekt(r.data); else dropProjekt(id);
     afterProj();
   }
@@ -1536,8 +1545,8 @@
           $("projErr").textContent = "Jemand hat dieses Projekt gerade geändert. Abbrechen zeigt die neue Fassung, Speichern überschreibt sie mit deiner.";
           return;
         }
-        putProjekt(res.data[0]);
         if (!gleicheSitzung(sg)) return;
+        putProjekt(res.data[0]);
         if (!hier()) { afterProj(); toast(`„${kurz(titel, 40)}“ gespeichert`); return; }
         // Aus dem Termin angelegt (nach verlorener Antwort hier weitergeführt): Projekt im Termin auswählen
         projDlg.close(); afterProj();
@@ -1790,22 +1799,29 @@
     loginStamp.set(0);
     showLogin(msg);
     const nr = store.get(MARKE);
-    const lauf = (async () => {
-      let failed = true;
-      // Ohne Netz kann das Abmelden lange hängen: nach 10 s wie gescheitert behandeln
-      try { failed = !!(await within(sb.auth.signOut({ scope: "local" }), 10000)).error; } catch {}
-      if (!failed) return;
-      // Ohne Antwort vom Server: die Sitzung trotzdem vom Gerät löschen (geteiltes Gerät). Gehört sie inzwischen der
-      // nächsten Anmeldung, bleibt sie; eine spät erneuerte Sitzung des vorigen Kontos wird gelöscht.
-      // Andere Tabs sperren sich dabei selbst (siehe „storage“ unten).
+    // Ohne Antwort vom Server: die Sitzung trotzdem vom Gerät löschen (geteiltes Gerät). Gehört sie inzwischen der
+    // nächsten Anmeldung, bleibt sie; eine spät erneuerte Sitzung des vorigen Kontos wird gelöscht.
+    // Andere Tabs sperren sich dabei selbst (siehe „storage“ unten).
+    const loeschen = () => {
       try {
         const roh = localStorage.getItem(sb.auth.storageKey), marke = store.get(MARKE);
         let mail = ""; try { mail = String(JSON.parse(roh)?.user?.email || "").toLowerCase(); } catch {}
         if (roh && (marke === nr || mail !== String(marke || "").split(" ")[1])) localStorage.removeItem(sb.auth.storageKey);
       } catch {}
+    };
+    // true: gescheitert (die Bibliothek hat dann nichts gelöscht)
+    const ergebnis = sb.auth.signOut({ scope: "local" }).then(r => !!r?.error, () => true);
+    const lauf = (async () => {
+      // Ohne Netz kann das Abmelden lange hängen: nach 10 s schon einmal vom Gerät löschen
+      const failed = await Promise.race([ergebnis, new Promise(r => setTimeout(() => r("zeit"), 10000))]);
+      if (failed === false) return;
+      loeschen();
+      // Das Abmelden kann hinter einer Token-Erneuerung warten, die die Sitzung danach zurückschreibt:
+      // scheitert es später doch noch, noch einmal prüfen
+      if (failed === "zeit") ergebnis.then(f => { if (f) loeschen(); });
     })();
-    // Auch ein noch laufendes früheres Abmelden abwarten
-    abmelden = Promise.all([abmelden, lauf]);
+    // Eine neue Anmeldung wartet auf das echte Abmelden (höchstens 10 s, siehe signIn), auch ein früheres
+    abmelden = Promise.all([abmelden, lauf, ergebnis]);
     await lauf;
   }
   // Nur Kalender-Konten: der Team-Zugang und die persönlichen Zugänge (Adressen ohne Postfach unter kalender.wattcon-installation.de)
@@ -1920,6 +1936,7 @@
   // Ein neuerer Anmeldeversuch (z. B. nach „Zurück zur Anmeldung“ während des Einrichtens) überholt einen älteren:
   // der ältere ändert dann nichts mehr (UEBERHOLT).
   const UEBERHOLT = { ueberholt: true };
+  const FREMD = "Auf diesem Gerät hat sich inzwischen jemand anderes angemeldet. Bitte erneut anmelden.";
   let anmeldNr = 0, anmelden = Promise.resolve();
   // Ein überholter Versuch hat sich trotzdem angemeldet (die Bibliothek speichert die Sitzung sofort): diese Anmeldung beim
   // Server beenden und, liegt sie noch auf dem Gerät, dort löschen. Sonst wäre man nach dem Neuladen ohne Passwort darin.
@@ -1936,29 +1953,43 @@
   }
   async function signIn(email, pw) {
     const nr = ++anmeldNr, aktuell = () => nr === anmeldNr;
-    // Erst das vorige Abmelden und einen noch laufenden älteren Versuch zu Ende kommen lassen, damit dessen Sitzung nicht
-    // die neue überschreibt (hängt die Verbindung, höchstens 10 s; verwerfen und die Prüfung unten fangen den Rest ab)
-    await Promise.race([Promise.all([abmelden, anmelden]), new Promise(r => setTimeout(r, 10000))]);
+    // Erst das vorige Abmelden und noch laufende ältere Versuche zu Ende kommen lassen, damit deren Sitzung nicht die neue
+    // überschreibt oder löscht. getSession wartet auf die Sperre der Bibliothek, auch auf ein Abmelden in einem anderen Tab.
+    // Hängt die Verbindung, höchstens 10 s; verwerfen und die Prüfungen unten fangen den Rest ab.
+    const sperre = sb.auth.getSession().then(() => {}, () => {});
+    await Promise.race([Promise.all([abmelden, anmelden, sperre]), new Promise(r => setTimeout(r, 10000))]);
     if (!aktuell()) return UEBERHOLT;
     let error = null, data = null;
     const versuch = sb.auth.signInWithPassword({ email, password: pw });
-    anmelden = versuch.then(() => {}, () => {});
+    anmelden = Promise.all([anmelden, versuch.then(() => {}, () => {})]);
     try { ({ data, error } = await versuch); } catch (e) { error = e; }
     if (!aktuell()) { verwerfen(data?.session); return UEBERHOLT; }
     if (error) return error;
     const mail = String(data?.session?.user?.email || "").toLowerCase();
-    if (data?.session) store.set(MARKE, Math.random().toString(36).slice(2) + " " + mail);
-    if (!kalUser(data?.session)) { lockOut("Anmelden hat nicht geklappt."); return null; }
+    const meine = Math.random().toString(36).slice(2) + " " + mail;
+    if (data?.session) store.set(MARKE, meine);
+    // Diese Anmeldung gilt nicht. Liegt inzwischen die Sitzung einer neueren Anmeldung (auch aus einem anderen Tab) im
+    // Speicher, bleibt sie, und nur die eigene wird beim Server beendet; sonst abmelden wie sonst auch.
+    const scheitern = (msg) => {
+      let st = null; try { st = JSON.parse(localStorage.getItem(sb.auth.storageKey)); } catch {}
+      const marke = store.get(MARKE);
+      if (data?.session && st && st.access_token !== data.session.access_token && marke !== meine
+          && String(st.user?.email || "").toLowerCase() === String(marke || "").split(" ")[1]) {
+        verwerfen(data.session); showLogin(FREMD); return null;
+      }
+      lockOut(msg); return null;
+    };
+    if (!kalUser(data?.session)) return scheitern("Anmelden hat nicht geklappt.");
     let me;
     try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
     if (!aktuell()) { verwerfen(data.session); return UEBERHOLT; }
-    if (!me.error && !me.data) { lockOut("Dieses Konto hat keinen Zugang zum Kalender."); return null; }
+    if (!me.error && !me.data) return scheitern("Dieses Konto hat keinen Zugang zum Kalender.");
     // Gehört die gespeicherte Sitzung noch zu diesem Konto? Ein spätes Abmelden oder eine späte Token-Erneuerung des
     // vorigen Kontos könnte sie gelöscht oder überschrieben haben: dann lieber noch einmal anmelden lassen
     let jetzt = null;
     try { jetzt = (await sb.auth.getSession()).data.session; } catch {}
     if (!aktuell()) { verwerfen(data.session); return UEBERHOLT; }
-    if ((jetzt?.user?.email || "").toLowerCase() !== mail) { lockOut("Anmelden hat nicht geklappt. Bitte noch einmal anmelden."); return null; }
+    if ((jetzt?.user?.email || "").toLowerCase() !== mail) return scheitern("Anmelden hat nicht geklappt. Bitte noch einmal anmelden.");
     myEmail = mail;
     state.me = me.error ? null : me.data;
     meAt = me.error ? 0 : Date.now();
@@ -2348,7 +2379,7 @@
       // und leeren statt unter falschem Namen weiterzuarbeiten. Nicht abmelden: die Sitzung gehört der neueren Anmeldung.
       // Nicht im Rückruf selbst, der läuft unter der Sperre der Bibliothek.
       else if (session && myEmail && !isLocked() && String(session.user?.email || "").toLowerCase() !== myEmail)
-        setTimeout(() => { if (!isLocked()) showLogin("Auf diesem Gerät hat sich inzwischen jemand anderes angemeldet. Bitte erneut anmelden."); });
+        setTimeout(() => { if (!isLocked()) showLogin(FREMD); });
     });
     // Abmelden (auch ohne Netz) oder eine Anmeldung unter anderem Konto in einem anderen Tab: auch diese Seite sperren.
     // Das Ereignis kommt nur aus anderen Tabs; die Sitzung gehört dann nicht mehr dieser Seite, also nicht abmelden.
@@ -2357,7 +2388,7 @@
       if (e.key === null || ((e.key === sb.auth.storageKey || e.key === "kal.loginAt") && e.newValue == null)) { showLogin("Bitte erneut anmelden."); return; }
       if (e.key === sb.auth.storageKey && myEmail) {
         let m = ""; try { m = String(JSON.parse(e.newValue)?.user?.email || "").toLowerCase(); } catch {}
-        if (m !== myEmail) showLogin("Auf diesem Gerät hat sich inzwischen jemand anderes angemeldet. Bitte erneut anmelden.");
+        if (m !== myEmail) showLogin(FREMD);
       }
     });
     const { data } = await sb.auth.getSession();
