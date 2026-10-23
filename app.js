@@ -1866,8 +1866,8 @@
   }
   let names = [], namesT = null, namesSeq = 0;
   // waehle: diesen Namen auswählen (z. B. gerade eingerichtet), sonst bleibt die bisherige Auswahl;
-  // nurLeer: nur, solange noch kein Name ausgewählt ist (eine eigene Wahl bleibt)
-  async function loadNames(waehle, nurLeer) {
+  // weich: nur, wenn der Name seit dem Öffnen der Anmeldung nicht selbst gewählt wurde (eine eigene Wahl bleibt)
+  async function loadNames(waehle, weich) {
     clearTimeout(namesT);
     if (!sb) return;
     const seq = ++namesSeq;
@@ -1882,12 +1882,12 @@
     }
     if (/Namensliste/.test($("loginErr").textContent)) $("loginErr").textContent = "";
     names = r.data;
-    fillNames(names, true, waehle, nurLeer);
+    fillNames(names, true, waehle, weich);
   }
   const optVal = (n) => n.team ? "team" : n.id;
   // Zur Auswahl stehen nur Personen mit eigenem Passwort und, solange es ihn gibt, der Team-Zugang
-  function fillNames(list, ok, waehle, nurLeer) {
-    const sel = $("loginName"), keep = (nurLeer && sel.value) || waehle || sel.value || store.get("kal.loginName") || "";
+  function fillNames(list, ok, waehle, weich) {
+    const sel = $("loginName"), keep = (weich && nameSelbst && sel.value) || waehle || sel.value || store.get("kal.loginName") || "";
     sel.replaceChildren(...(list.length ? [el("option", { value: "" }, "Name wählen …"), ...list.map(n => el("option", { value: optVal(n) }, n.name))]
       : [el("option", { value: "" }, ok ? "Noch niemand eingerichtet" : "Keine Namen geladen")]));
     if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
@@ -1899,13 +1899,15 @@
     const o = $("loginName").selectedOptions[0];
     $("loginUser").value = o && o.value ? o.textContent : "";
   }
-  $("loginName").addEventListener("change", () => { syncUser(); $("loginErr").textContent = ""; });
+  // Hat die Person ihren Namen selbst gewählt (nicht nur vorbelegt)? Gilt bis zum nächsten Wechsel Anmelden/Einrichten.
+  let nameSelbst = false;
+  $("loginName").addEventListener("change", () => { nameSelbst = true; syncUser(); $("loginErr").textContent = ""; });
   addEventListener("online", () => { if (isLocked()) loadNames(); });
 
   // Zählt das Wechseln zwischen Anmelden und Einrichten: eine späte Antwort ändert ein neu begonnenes Einrichten nicht
   let setupNr = 0;
   function showSetup(on) {
-    setupNr++; $("setupBtn").disabled = false;
+    setupNr++; nameSelbst = false; $("setupBtn").disabled = false;
     $("loginForm").hidden = on; $("setupForm").hidden = !on;
     $("setupErr").textContent = ""; $("loginErr").textContent = "";
     ["setupCode", "setupPw", "setupPw2"].forEach(id => { $(id).value = ""; });
@@ -2018,7 +2020,7 @@
       // geklappt hat (der Code ist damit verbraucht), und die Namensliste neu laden, damit der Name zur Auswahl steht.
       if (res && res.ok && out && out.ok && isLocked()) {
         if (out.id) store.set("kal.loginName", String(out.id));
-        // Den eigenen Namen gleich auswählen, außer es ist schon ein Name gewählt oder ein Passwort (für jemand anderen) eingetippt
+        // Den eigenen Namen gleich auswählen, außer es wurde schon ein Name gewählt oder ein Passwort (für jemand anderen) eingetippt
         loadNames(out.id && !$("loginPw").value ? String(out.id) : undefined, true);
         if (!$("loginForm").hidden) $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden.";
         else $("setupErr").textContent = "Das zuerst eingegebene Passwort ist gespeichert, der Code ist damit verbraucht. Bitte „Zurück zur Anmeldung“ und damit anmelden.";
