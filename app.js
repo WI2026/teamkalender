@@ -1032,6 +1032,8 @@
     const act = document.activeElement;
     progOpener = act && act.matches && act.matches(".prow, .ppill") ? act : null;
     progId = id; progGen++; progFromEditor = dlg.open; progTermine = null; progEdit = false; progAlle = false;
+    // Was das Schließen verwirft, auch hier: das close-Ereignis kann nach einem schnellen Wiederöffnen ausfallen
+    reopenId = null; disarmDel(); clearTimeout(reopenT); clearTimeout(progInfoT); clearTimeout(progTermineT);
     $("progBody").replaceChildren(
       el("header", { class: "phead", id: "progHead" }),
       el("div", { class: "pscroll", id: "progScroll" },
@@ -2027,7 +2029,7 @@
   }
   $("teamBtn").addEventListener("click", () => {
     $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
-    $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null;
+    $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null; $("addForm").reset();
     disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
     teamGen++; oeffne(teamDlg); loadTeam();
   });
