@@ -2083,9 +2083,11 @@
     // Passwort steht: gleich damit anmelden. Verlässt die Person das Einrichten, solange signIn noch wartet, meldet es nicht an.
     if (out.id) store.set("kal.loginName", String(out.id));
     const hier = () => nr === setupNr;
+    const versuch = signIn(out.email, pw, hier), meinVersuch = anmeldNr;
     let error;
-    try { error = await signIn(out.email, pw, hier); } finally { if (hier()) $("setupBtn").disabled = false; }
-    if (!hier()) { spaetGespeichert(out); return; }
+    try { error = await versuch; } finally { if (hier()) $("setupBtn").disabled = false; }
+    // Inzwischen hat sich jemand anderes angemeldet oder meldet sich gerade an: dessen Anmeldung bestimmt die Meldung
+    if (!hier()) { if (meinVersuch === anmeldNr) spaetGespeichert(out); return; }
     ["setupCode", "setupPw", "setupPw2"].forEach(x => { $(x).value = ""; });
     if (error === UEBERHOLT) return;
     if (error) { showSetup(false); loadNames(out.id ? String(out.id) : undefined); $("loginErr").textContent = "Dein Passwort ist gespeichert. Bitte jetzt damit anmelden."; return; }
