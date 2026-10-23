@@ -124,7 +124,9 @@
     pfilter: { status: "laufend", q: "" },
   };
   // Schritte, die gerade geladen werden, und solche, die nach einem Fehler später erneut geladen werden
-  const stepLaedt = new Set(), stepWarten = new Set();
+  // Laufende Einzel-Ladungen: Projekt → Nummer des Ladevorgangs (nur der eigene Vorgang räumt seinen Eintrag ab)
+  const stepLaedt = new Map(), stepWarten = new Set();
+  let stepLadeNr = 0;
   // Zählt Abmeldungen: späte Antworten einer beendeten Anmeldung zeigen nichts mehr an
   let sitzGen = 0;
   const gleicheSitzung = (g) => g === sitzGen && !document.body.classList.contains("locked");
@@ -461,7 +463,7 @@
     syncAllDay();
     $("f-title").autofocus = !ro && !e;
     $("cancelBtn").autofocus = ro || !!e;
-    dlg.showModal();
+    oeffne(dlg);
   }
   // Zeitstempel kommen je nach Weg als "…T…+00:00" oder "… …+00"
   const tsOf = (v) => Date.parse(String(v || "").replace(" ", "T").replace(/([+-]\d\d)$/, "$1:00"));
@@ -595,6 +597,8 @@
     const t = $("toast");
     if (d.contains(t)) { if (!t.hidden && t.textContent) zeigToast(); else document.body.append(t); }
   }));
+  // Ein Fenster geht auf, während eine Meldung steht: mit hinein, sonst läge sie verdeckt dahinter
+  function oeffne(d) { d.showModal(); const t = $("toast"); if (!t.hidden && t.textContent) zeigToast(); }
   const kurz = (x, n) => x.length > n ? x.slice(0, n - 1).trimEnd() + "…" : x;
   // Der Text kann einen Projektnamen enthalten: nach dem Ausblenden nicht im Dokument stehen lassen
   function hideToast() { clearTimeout(toastT); const t = $("toast"); t.hidden = true; t.textContent = ""; if (t.hidePopover) try { t.hidePopover(); } catch {} }
@@ -885,8 +889,8 @@
     // Kurz nach einem Fehler nicht gleich wieder fragen, aber auch nicht aufgeben
     const warte = stepPause - (Date.now() - stepFailAt);
     if (warte > 0) { spaeterSchritte(need, warte); return; }
-    const seq = projSeq, sagen = progDlg.open && need.includes(progId) && stepWarten.has(progId);
-    need.forEach(id => { state.schritteVon.add(id); stepLaedt.add(id); stepWarten.delete(id); });
+    const seq = projSeq, nr = ++stepLadeNr;
+    need.forEach(id => { state.schritteVon.add(id); stepLaedt.set(id, nr); stepWarten.delete(id); });
     try {
       for (let i = 0; i < need.length; i += 100) {
         const chunk = need.slice(i, i + 100);
@@ -895,17 +899,18 @@
         for (const r of part) if (sTouched.get(r.id) !== null) applySchritt(r);
       }
       stepPause = 0;
-      if (sagen && progDlg.open && need.includes(progId)) progSay("Schritte geladen.");
     } catch (e) {
       if (seq !== projSeq || projFail(e)) return;
       stepFailAt = Date.now(); stepPause = Math.min(stepPause ? stepPause * 2 : 15000, 120000);
       need.forEach(id => state.schritteVon.delete(id));
       spaeterSchritte(need, stepPause);
-      if (progDlg.open && need.includes(progId)) progSay("Schritte konnten nicht geladen werden. Neuer Versuch läuft gleich von selbst.");
+      if (progDlg.open && need.includes(progId)) progSay("Schritte konnten nicht geladen werden. Neuer Versuch läuft gleich von selbst.", true);
     } finally {
-      need.forEach(id => stepLaedt.delete(id));
-      // Von einem vollständigen Neuladen überholt: trotzdem neu zeichnen (sonst bliebe „…“ stehen)
-      if (seq !== projSeq && !isLocked()) afterProjBald();
+      const meine = need.filter(id => stepLaedt.get(id) === nr);
+      meine.forEach(id => stepLaedt.delete(id));
+      // Von einem vollständigen Neuladen überholt, das noch läuft oder gescheitert ist: wieder als „nicht geladen“ führen
+      // (sonst stünde „Noch keine Schritte“ da) und neu zeichnen, damit die Anzeige sie neu anfordert
+      if (seq !== projSeq && !isLocked()) { meine.forEach(id => state.schritteVon.delete(id)); afterProjBald(); }
     }
     afterProj();
   }
@@ -1038,13 +1043,17 @@
         el("section", { class: "ptermine", id: "progTermine" })),
       el("footer", { class: "pfoot", id: "progFoot" }));
     renderProg();
-    progDlg.showModal();
+    oeffne(progDlg);
     $("progScroll").scrollTop = 0;
     ensureSchritte([id]);
     loadProgTermine();
   }
-  // Nur für Bildschirmleser: Laden der Schritte geklappt oder nicht
-  function progSay(msg) { const n = $("progSay"); if (!n) return; n.textContent = ""; setTimeout(() => { if ($("progSay")) $("progSay").textContent = msg; }, 50); }
+  // Nur für Bildschirmleser: Laden der Schritte gescheitert; ein gemeldeter Fehler wird beim nächsten erfolgreichen Laden widerrufen (renderProg)
+  function progSay(msg, fehler) {
+    const n = $("progSay"); if (!n) return;
+    n.textContent = ""; n.dataset.fehl = fehler ? "1" : "";
+    setTimeout(() => { if ($("progSay") === n) n.textContent = msg; }, 50);
+  }
   // Kurze Rückmeldung im Fenster selbst (eine Meldung unten am Bildschirm läge hinter dem Fenster)
   let progInfoT = null;
   function progInfo(msg) {
@@ -1084,6 +1093,7 @@
     const p = state.projekte.get(progId);
     if (!p) return;
     const f = fortschritt(p.id), ro = !state.canWrite, edit = progEdit && !ro, fehl = !f.loaded && stepWarten.has(p.id);
+    if (f.loaded && $("progSay")?.dataset.fehl) progSay("Schritte geladen.");
     const act = document.activeElement, focusSid = act && act.closest && act.closest("#progSteps [data-sid]")?.dataset.sid;
     const focusCls = act && act.classList ? [...act.classList].find(c => c === "reopen" || c === "sdel") || "" : "";
     fill($("progHead"),
@@ -1213,12 +1223,22 @@
     if (e && e.status === 429) return "Gerade zu viele Änderungen auf einmal. Bitte kurz warten und erneut versuchen.";
     return "Speichern hat nicht geklappt. Prüfe die Verbindung und versuche es erneut.";
   };
-  // Fehler zu einem Projekt: im Fenster, solange es dieses Projekt zeigt; zeigt es ein anderes, dort mit Namen; sonst unten am Bildschirm
-  // (sonst bliebe z. B. ein zurückgenommenes Häkchen nach dem Schließen unbemerkt). Nach dem Abmelden nichts mehr.
+  // Fehler zu einem Projekt: im Fenster unter der Liste, wenn es dieses Projekt zeigt und die Stelle gerade zu sehen ist;
+  // sonst als Meldung oben (im offenen Fenster), bei einem anderen Projekt mit Namen. Sonst bliebe z. B. ein zurückgenommenes
+  // Häkchen unbemerkt. Nach dem Abmelden nichts mehr.
   function projMeldung(pid, m, sonst, sg) {
     if (!m || !gleicheSitzung(sg)) return;
-    if (progDlg.open && $("progErr")) $("progErr").textContent = progId === pid ? m : sonst || m;
-    else toast(sonst || m, 7000);
+    const hier = progDlg.open && progId === pid, e = hier && $("progErr");
+    if (e) {
+      // Erst schreiben, dann messen (leer ist das Feld ausgeblendet); im selben Schritt wieder leeren wird nicht angesagt.
+      // Wer gerade im Feld „Neuer Schritt“ ist, bekommt die Meldung direkt darunter (ein kleines Stück weiterrollen)
+      e.textContent = m;
+      if ($("progAdd").contains(document.activeElement)) e.scrollIntoView({ block: "nearest" });
+      const a = e.getBoundingClientRect(), b = $("progScroll").getBoundingClientRect(), vv = window.visualViewport;
+      if (a.top >= b.top - 1 && a.bottom <= Math.min(b.bottom, vv ? vv.offsetTop + vv.height : innerHeight) + 1) return;
+      e.textContent = "";
+    }
+    toast(hier ? m : sonst || m, 7000);
   }
   // Abhaken: sofort anzeigen, bei Fehler zurücknehmen. „Wer und wann“ trägt die Datenbank ein.
   async function toggleStep(sid, on) {
@@ -1384,7 +1404,7 @@
     $("projStamp").textContent = p && p.updated_at ? `Geändert ${fmtStamp(p.updated_at)}` : "";
     syncVorlage();
     $("p-titel").autofocus = !p;
-    projDlg.showModal();
+    oeffne(projDlg);
   }
   $("projCancel").addEventListener("click", () => projDlg.close());
   function wipeProjForm() {
@@ -1991,7 +2011,7 @@
     $("teamErr").textContent = ""; hideCode(); $("people").replaceChildren(); $("teamOff").hidden = true; $("adminTip").hidden = true;
     $("teamStart").hidden = true; $("logBtn").hidden = true; teamData = null;
     disarm($("teamOffBtn")); offOk = false; $("teamOffBtn").disabled = true;
-    teamDlg.showModal(); loadTeam();
+    oeffne(teamDlg); loadTeam();
   });
   $("teamClose").addEventListener("click", () => teamDlg.close());
   // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
@@ -2097,7 +2117,7 @@
   }
   $("logBtn").addEventListener("click", () => {
     logGen++; logLast = null; $("logList").replaceChildren(); $("logErr").textContent = ""; $("logMore").hidden = true;
-    logDlg.showModal(); loadLog(false);
+    oeffne(logDlg); loadLog(false);
   });
   $("logMore").addEventListener("click", () => loadLog(true));
   $("logCsv").addEventListener("click", saveLog);
