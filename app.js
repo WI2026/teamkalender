@@ -702,15 +702,18 @@
   // ---------- Verbindung (Supabase) ----------
   const CFG = window.KALENDER_CONFIG || {};
   // Alle Anfragen der Bibliothek laufen hier durch.
-  // - Abmelden hat sonst keine Zeitgrenze: solange es hängt, hält die Bibliothek ihre Sperre, und eine neue Anmeldung kommt nicht
-  //   über die Zugangsprüfung hinaus. Nur das Abmelden: eine abgebrochene Token-Erneuerung würde die Sitzung verlieren.
+  // - Zeitgrenzen für die Anmeldung: Solange eine Anfrage hängt, hält die Bibliothek ihre Sperre, und niemand kommt mehr über
+  //   die Zugangsprüfung hinaus (auch nicht in einem neuen Tab). Abmelden und Anmelden mit Passwort: 15 s, ein Abbruch hinterlässt
+  //   keine Sitzung. Token-Erneuerung: 30 s, damit auch eine langsame Antwort noch ankommt. Danach wiederholt die Bibliothek nicht
+  //   mehr mit demselben (vielleicht schon verbrauchten) Token; die Sitzung bleibt, die nächste Erneuerung versucht es erneut.
   // - Datenbank-Anfragen gehören zu der Anmeldung, in der sie abgeschickt wurden (kalSitz, siehe unten). Wartet eine noch auf ihr
   //   Token (z. B. hinter einer langsamen Erneuerung) und ist die Anmeldung inzwischen beendet, geht sie nicht mehr hinaus: sonst
   //   liefe sie mit dem Token der nächsten Person. Liegt inzwischen ein anderes Konto auf dem Gerät, sperrt sich die Seite.
   //   Ist die Sitzung noch da, aber ohne gültiges Token (Erneuerung gescheitert), ebenfalls nicht: das ist ein Verbindungsproblem
   //   und kein Abmelden; mit dem öffentlichen Schlüssel käme „Anmeldung abgelaufen“ zurück. Ist gar keine Sitzung mehr da, geht
   //   sie hinaus und die Antwort sperrt die Seite.
-  const AUTH_MS = 15000;
+  const AUTH_MS = { logout: 15000, password: 15000, refresh_token: 30000 };
+  const authArt = (u) => { const m = /\/auth\/v1\/(?:(logout)|token\?grant_type=(password|refresh_token))(?:[?&#]|$)/.exec(String(u)); return m ? m[1] || m[2] : ""; };
   const gespeichertVon = () => { try { return String(JSON.parse(localStorage.getItem(sb.auth.storageKey))?.user?.email || "").toLowerCase(); } catch { return ""; } };
   const authFetch = (u, o) => {
     if (o && "kalSitz" in o) {
@@ -720,16 +723,22 @@
         return Promise.reject(new TypeError("Anmeldung beendet oder nicht erneuert"));
       return fetch(u, rest);
     }
-    if (o?.signal || !/\/auth\/v1\/logout(\?|$)/.test(String(u))) return fetch(u, o);
+    const art = o?.signal ? "" : authArt(u);
+    if (!art) return fetch(u, o);
     const ctl = new AbortController();
-    setTimeout(() => ctl.abort(new DOMException("signal timed out", "TimeoutError")), AUTH_MS);
+    setTimeout(() => ctl.abort(new DOMException("signal timed out", "TimeoutError")), AUTH_MS[art]);
     return fetch(u, { ...o, signal: ctl.signal });
   };
   const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }, global: { fetch: authFetch } }) : null;
   // Die Bibliothek ruft diese Funktion auf, sobald eine Abfrage abgeschickt wird (await), noch bevor sie auf ihr Token wartet:
-  // hier wird die Anfrage an die laufende Anmeldung gebunden. Während der Anmeldemaske (Namensliste, Zugangsprüfung beim
-  // Anmelden) gibt es keine.
-  if (sb) { const restFetch = sb.rest.fetch; sb.rest.fetch = (u, o) => restFetch(u, isLocked() ? o : { ...o, kalSitz: sitzGen }); }
+  // hier wird die Anfrage an die laufende Anmeldung gebunden. Vor der Anmeldung (gesperrte Seite) gehen nur die Namensliste und
+  // die Zugangsprüfung hinaus; dabei kann schon die Sitzung der nächsten Person gespeichert sein.
+  const VOR_ANMELDUNG = /\/rest\/v1\/rpc\/kalender_(?:namen|ich)(?:\?|$)/;
+  if (sb) {
+    const restFetch = sb.rest.fetch;
+    sb.rest.fetch = (u, o) => !isLocked() ? restFetch(u, { ...o, kalSitz: sitzGen })
+      : VOR_ANMELDUNG.test(String(u)) ? restFetch(u, o) : Promise.reject(new TypeError("Nicht angemeldet"));
+  }
   const fromRow = (r) => ({ title: r.title, date: r.date, allDay: !!r.all_day, start: r.start_time || "", end: r.end_time || "",
     person: r.person || "", note: r.note || "", cat: r.cat || "buero", projektId: r.projekt_id || null, createdAt: r.created_at, updatedAt: r.updated_at });
   const toRow = (b) => Object.assign({ title: b.title, date: b.date, all_day: !!b.allDay, start_time: b.allDay ? null : b.start, end_time: b.allDay ? null : b.end,
@@ -1360,7 +1369,7 @@
       else {
         // Nichts geändert: entweder gestrichen oder der Zugang gilt nicht mehr
         if (state.schritte.get(sid) === opt) state.schritte.set(sid, prev);
-        if (await checkMe() === "weg") return;
+        if (await checkMe() === "weg" || !gleicheSitzung(sg)) return;
         const now = await sb.from(ST).select(SCOLS).eq("id", sid).maybeSingle();
         if (isLocked() || sg !== sitzGen) return;
         if (now.error) throw now.error;
@@ -1564,6 +1573,7 @@
         const res = await sb.from(PT).update(neu).eq("id", edit).eq("updated_at", projStamp).select(PCOLS);
         check(res);
         if (!res.data.length) {
+          if (!gleicheSitzung(sg)) return;
           await reloadProjekt(edit);
           if (!gleicheSitzung(sg)) return;
           const weg = !state.projekte.has(edit);
@@ -1586,7 +1596,8 @@
           p_verantwortlich: wer, p_notiz: notiz, p_schritte: vorlageGewaehlt() });
         // 23505: der erste Versuch kam schon an, nur die Antwort ging verloren
         if (res.error && res.error.code !== "23505") throw res.error;
-        // Gleich nachladen, nicht auf die Live-Verbindung warten
+        // Gleich nachladen, nicht auf die Live-Verbindung warten (nur in derselben Anmeldung)
+        if (!gleicheSitzung(sg)) return;
         const one = await sb.from(PT).select(PCOLS).eq("id", id).maybeSingle();
         if (!gleicheSitzung(sg)) return;
         if (one.data) putProjekt(one.data);
@@ -1644,6 +1655,7 @@
       check(res);
       if (!res.data.length) {
         // Schon weg oder kein Verwalter
+        if (!gleicheSitzung(sg)) return;
         await reloadProjekt(id);
         if (!gleicheSitzung(sg)) return;
         if (state.projekte.has(id)) {
@@ -2130,6 +2142,8 @@
     if (s.error || sg !== sitzGen) throw { status: 0 };
     const tok = s.data && s.data.session && s.data.session.access_token;
     if (!tok) throw { status: 401 };
+    // Liegt (ohne Ereignis) die Sitzung eines anderen Kontos auf dem Gerät: nicht als diese Person ausführen, Seite sperren
+    if (myEmail && String(s.data.session.user?.email || "").toLowerCase() !== myEmail) { if (!isLocked()) showLogin(FREMD); throw { status: 0 }; }
     let res;
     try {
       res = await postFn(body, { Authorization: "Bearer " + tok });
