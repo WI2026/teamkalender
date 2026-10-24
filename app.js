@@ -705,7 +705,8 @@
   // - Zeitgrenzen für die Anmeldung: Solange eine Anfrage hängt, hält die Bibliothek ihre Sperre, und niemand kommt mehr über
   //   die Zugangsprüfung hinaus (auch nicht in einem neuen Tab). Abmelden und Anmelden mit Passwort: 15 s, ein Abbruch hinterlässt
   //   keine Sitzung. Token-Erneuerung: 30 s, damit auch eine langsame Antwort noch ankommt. Danach wiederholt die Bibliothek nicht
-  //   mehr mit demselben (vielleicht schon verbrauchten) Token; die Sitzung bleibt, die nächste Erneuerung versucht es erneut.
+  //   mehr mit demselben (vielleicht schon verbrauchten) Token; die Sitzung bleibt, die nächste Erneuerung versucht es erneut
+  //   (frühestens 30 s später, siehe takt).
   // - Datenbank-Anfragen gehören zu der Anmeldung, in der sie abgeschickt wurden (kalSitz, siehe unten). Wartet eine noch auf ihr
   //   Token (z. B. hinter einer langsamen Erneuerung) und ist die Anmeldung inzwischen beendet, geht sie nicht mehr hinaus: sonst
   //   liefe sie mit dem Token der nächsten Person. Liegt inzwischen ein anderes Konto auf dem Gerät, sperrt sich die Seite.
@@ -729,11 +730,23 @@
     setTimeout(() => ctl.abort(new DOMException("signal timed out", "TimeoutError")), AUTH_MS[art]);
     return fetch(u, { ...o, signal: ctl.signal });
   };
-  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }, global: { fetch: authFetch } }) : null;
+  const sb = window.supabase && CFG.url ? window.supabase.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: false, detectSessionInUrl: false }, global: { fetch: authFetch } }) : null;
+  // Token-Erneuerung selbst takten (autoRefreshToken: false). Der Takt der Bibliothek reiht sich alle 30 s hinter eine noch
+  // laufende Erneuerung ein: bekommt keine innerhalb von 30 s Antwort, beginnt die nächste sofort, und die Sperre der Bibliothek
+  // wird nie frei (die Seite und neue Tabs warten dann endlos). Hier beginnt der nächste Takt erst 30 s nach dem Ende des vorigen,
+  // und wie bei der Bibliothek nur in einem sichtbaren Tab (beim Sichtbarwerden sofort), hier zudem nur angemeldet. Ein
+  // abgelaufenes Token erneuert die Bibliothek ohnehin vor der nächsten Anfrage.
+  let taktT = 0, taktLauf = null;
+  function takt(sofort) {
+    clearTimeout(taktT); taktT = 0;
+    if (!sb || taktLauf || isLocked() || document.visibilityState !== "visible" || typeof sb.auth._autoRefreshTokenTick !== "function") return;
+    if (!sofort) { taktT = setTimeout(takt, 30000, true); return; }
+    taktLauf = sb.auth._autoRefreshTokenTick().catch(() => {}).finally(() => { taktLauf = null; takt(); });
+  }
   // Die Bibliothek ruft diese Funktion auf, sobald eine Abfrage abgeschickt wird (await), noch bevor sie auf ihr Token wartet:
-  // hier wird die Anfrage an die laufende Anmeldung gebunden. Vor der Anmeldung (gesperrte Seite) gehen nur die Namensliste und
-  // die Zugangsprüfung hinaus; dabei kann schon die Sitzung der nächsten Person gespeichert sein.
-  const VOR_ANMELDUNG = /\/rest\/v1\/rpc\/kalender_(?:namen|ich)(?:\?|$)/;
+  // hier wird die Anfrage an die laufende Anmeldung gebunden. Vor der Anmeldung (gesperrte Seite) geht nur die Zugangsprüfung
+  // hinaus (die Namensliste holt loadNames ohne die Bibliothek); dabei kann schon die Sitzung der nächsten Person gespeichert sein.
+  const VOR_ANMELDUNG = /\/rest\/v1\/rpc\/kalender_ich(?:\?|$)/;
   if (sb) {
     const restFetch = sb.rest.fetch;
     sb.rest.fetch = (u, o) => !isLocked() ? restFetch(u, { ...o, kalSitz: sitzGen })
@@ -1673,8 +1686,8 @@
       afterProj();
       toast(`${da ? "Projekt" : `„${kurz(name, 40)}“`} gelöscht. Die Termine bleiben, nur ohne Projekt.`);
     } catch (e) {
-      const m = projWriteError(e, sg);
-      if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m), 7000);
+      const m0 = projWriteError(e, sg), m = m0 === STEP_ALLG ? "Löschen hat nicht geklappt. Prüfe die Verbindung und versuche es erneut." : m0;
+      if (m && hier()) $("projErr").textContent = m; else if (m && gleicheSitzung(sg)) toast(nichtText(name, "gelöscht", m0), 7000);
     }
   }));
 
@@ -1785,13 +1798,17 @@
   let hiddenAt = Date.now();
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { hiddenAt = Date.now(); return; }
+    takt(true);
     if (sb && !isLocked() && Date.now() - hiddenAt > 60 * 1000) { refresh(); projAbgleich(); }
   });
 
   // Anmeldung gilt höchstens 30 Tage auf einem Gerät, danach muss das Passwort neu eingegeben werden.
+  // Der Stempel nennt das Konto: taucht eine andere Sitzung auf (z. B. spät zurückgeschrieben von einer Erneuerung des vorigen
+  // Kontos), gilt er für sie nicht. Ältere Stempel ohne Konto gelten weiter für die gespeicherte Sitzung.
   const MAX_SESSION_MS = 30 * 24 * 60 * 60 * 1000;
-  const loginStamp = { get() { try { return Number(localStorage.getItem("kal.loginAt")) || 0; } catch { return 0; } },
-    set(v) { try { v ? localStorage.setItem("kal.loginAt", String(v)) : localStorage.removeItem("kal.loginAt"); } catch {} } };
+  const loginStamp = {
+    get(mail) { try { const [t, wer] = String(localStorage.getItem("kal.loginAt") || "").split(" "); return !wer || wer === mail ? Number(t) || 0 : 0; } catch { return 0; } },
+    set(v, mail) { try { v ? localStorage.setItem("kal.loginAt", v + (mail ? " " + mail : "")) : localStorage.removeItem("kal.loginAt"); } catch {} } };
 
   function clearData() {
     if (channel) { sb.removeChannel(channel); channel = null; }
@@ -1805,8 +1822,9 @@
     if ($("logDlg").open) $("logDlg").close();
     if (progDlg.open) progDlg.close();
     if (projDlg.open) projDlg.close();
-    // Formulare und Unterfenster immer leeren, auch wenn sie gerade zu sind (späte Antworten, vom Browser wiederhergestellte Eingaben)
-    sitzGen++; wipeTermin(); wipeProjForm(); $("progBody").replaceChildren(); progOpener = null; hideToast();
+    // Formulare und Unterfenster immer leeren, auch wenn sie gerade zu sind (späte Antworten, vom Browser wiederhergestellte Eingaben).
+    // Nicht auf das close-Ereignis warten: in einem verborgenen Tab kommt es in Chrome erst beim Sichtbarwerden.
+    sitzGen++; wipeTermin(); wipeProjForm(); wipeTeam(); wipeLog(); $("progBody").replaceChildren(); progOpener = null; hideToast();
     projSeq++; naechsteSeq++; clearTimeout(projRetryT); clearTimeout(naechsteT); stepFailAt = 0; stepPause = 0;
     clearTimeout(stepRetryT); stepRetryT = 0; stepWarten.clear(); stepLaedt.clear(); fertigMax = 100;
     pTouched = new Map(); sTouched = new Map(); stepBusy.clear(); wantSet.clear(); clearTimeout(wantT); wantT = 0; disarmDel();
@@ -1873,6 +1891,7 @@
     $("loginPw").value = "";
     showMe();
     startLive();
+    takt();
     // Die erste Ladung kommt mit dem Verbinden der Live-Verbindung; hängt diese, nach 3 s direkt laden.
     clearTimeout(firstT);
     firstT = setTimeout(() => { if (!joined && !isLocked()) refresh(); }, 3000);
@@ -1923,6 +1942,16 @@
     return fetch(FN, { method: "POST", headers: { "Content-Type": "application/json", apikey: CFG.key, ...headers }, body: JSON.stringify(body), signal: ctl.signal })
       .finally(() => clearTimeout(t));
   }
+  // Die Namensliste kommt ohne Sitzung (öffentlicher Schlüssel) und nicht über die Bibliothek: die wartet vor jeder Anfrage auf
+  // ihre Sperre, und hinge dort eine Token-Erneuerung (auch in einem anderen Tab), bliebe die Anmeldung ohne Namen.
+  async function namenHolen() {
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 15000);
+    try {
+      const res = await fetch(CFG.url + "/rest/v1/rpc/kalender_namen", { method: "POST", body: "{}", signal: ctl.signal,
+        headers: { "Content-Type": "application/json", apikey: CFG.key, Authorization: "Bearer " + CFG.key } });
+      return res.ok ? { data: await res.json() } : { error: { status: res.status } };
+    } finally { clearTimeout(t); }
+  }
   let names = [], namesT = null, namesSeq = 0;
   // waehle: diesen Namen auswählen (z. B. gerade eingerichtet), sonst bleibt die bisherige Auswahl;
   // weich: nur, wenn der Name seit dem Öffnen der Anmeldung nicht selbst gewählt wurde (eine eigene Wahl bleibt)
@@ -1931,7 +1960,7 @@
     if (!sb) return;
     const seq = ++namesSeq;
     let r;
-    try { r = await sb.rpc("kalender_namen"); } catch (e) { r = { error: e }; }
+    try { r = await namenHolen(); } catch (e) { r = { error: e }; }
     if (seq !== namesSeq || !isLocked()) return;
     if (r.error || !Array.isArray(r.data)) {
       if (!names.length) fillNames([], false);
@@ -2024,20 +2053,30 @@
       lockOut(msg); return null;
     };
     if (!kalUser(data?.session)) return scheitern("Anmelden hat nicht geklappt.");
+    // Die Sitzung liegt schon auf dem Gerät: gleich als frisch markieren. Sonst hielte ein Tab, der während der Prüfungen unten
+    // geöffnet oder neu geladen wird, sie für abgelaufen und meldete diese Anmeldung ab. Scheitert sie, setzen lockOut bzw.
+    // verwerfen den Stempel zurück (verwerfen nur, solange die eigene Sitzung noch gespeichert ist).
+    loginStamp.set(Date.now(), mail);
+    // Höchstens 15 s auf die Zugangsprüfung warten; ohne Antwort weiter wie ohne Verbindung (die Seite fragt bald erneut).
+    // Abbrechen statt nur nicht mehr warten: sonst ginge sie nach dem Ende der Sperre noch mit der dann gespeicherten Sitzung hinaus.
     let me;
-    try { me = await sb.rpc("kalender_ich"); } catch (e) { me = { error: e }; }
+    const ichCtl = new AbortController(), ichT = setTimeout(() => ichCtl.abort(), 15000);
+    try { me = await within(sb.rpc("kalender_ich").abortSignal(ichCtl.signal), 15000); } catch (e) { me = { error: e }; }
+    clearTimeout(ichT);
     if (!aktuell()) { verwerfen(data.session); return UEBERHOLT; }
     if (!me.error && !me.data) return scheitern("Dieses Konto hat keinen Zugang zum Kalender.");
     // Gehört die gespeicherte Sitzung noch zu diesem Konto? Ein spätes Abmelden oder eine späte Token-Erneuerung des
-    // vorigen Kontos könnte sie gelöscht oder überschrieben haben: dann lieber noch einmal anmelden lassen
+    // vorigen Kontos könnte sie gelöscht oder überschrieben haben: dann lieber noch einmal anmelden lassen.
+    // Hält eine Erneuerung (auch in einem anderen Tab) die Sperre der Bibliothek länger als 20 s, ebenso: nicht ungeprüft
+    // hineingehen, denn sie könnte danach noch die Sitzung des vorigen Kontos zurückschreiben.
     let jetzt = null;
-    try { jetzt = (await sb.auth.getSession()).data.session; } catch {}
+    try { jetzt = (await within(sb.auth.getSession(), 20000)).data.session; } catch {}
     if (!aktuell()) { verwerfen(data.session); return UEBERHOLT; }
     if ((jetzt?.user?.email || "").toLowerCase() !== mail) return scheitern("Anmelden hat nicht geklappt. Bitte noch einmal anmelden.");
     myEmail = mail;
     state.me = me.error ? null : me.data;
     meAt = me.error ? 0 : Date.now();
-    loginStamp.set(Date.now());
+    loginStamp.set(Date.now(), mail);
     enter();
     return null;
   }
@@ -2301,9 +2340,10 @@
   });
   $("teamClose").addEventListener("click", () => teamDlg.close());
   // Codes und Namen nur so lange auf dem Bildschirm, wie das Fenster offen ist
+  function wipeTeam() { teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn")); teamData = null; }
   teamDlg.addEventListener("close", () => {
     if (teamDlg.open) return;
-    teamGen++; hideCode(); $("people").replaceChildren(); $("addForm").reset(); disarm($("teamOffBtn")); teamData = null;
+    wipeTeam();
     if (logDlg.open) logDlg.close();
   });
 
@@ -2413,7 +2453,8 @@
   $("logCsv").addEventListener("click", saveLog);
   $("logClose").addEventListener("click", () => logDlg.close());
   // Kundendaten nur so lange auf dem Bildschirm, wie das Fenster offen ist
-  logDlg.addEventListener("close", () => { if (logDlg.open) return; logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; });
+  function wipeLog() { logGen++; logBusy = false; $("logList").replaceChildren(); logLast = null; }
+  logDlg.addEventListener("close", () => { if (logDlg.open) return; wipeLog(); });
   $("addForm").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const name = $("addName").value.replace(/\s+/g, " ").trim(), admin = $("addAdmin").checked;
@@ -2449,11 +2490,34 @@
         if (m !== myEmail) showLogin(FREMD);
       }
     });
-    const { data } = await sb.auth.getSession();
-    const stamp = loginStamp.get();
-    if (data.session && !kalUser(data.session)) lockOut();
-    else if (data.session && stamp && Date.now() - stamp < MAX_SESSION_MS) { myEmail = data.session.user.email.toLowerCase(); enter(); checkMe(); }
-    else if (data.session) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
-    else showLogin();
+    // Die gespeicherte Anmeldung prüfen. Hängt dabei die Token-Erneuerung, nach 15 s trotzdem die Anmeldung zeigen statt endlos
+    // „Namen werden geladen“. Ein späteres Ergebnis gilt nur, wenn seitdem niemand mit Anmelden oder Einrichten begonnen hat;
+    // ein schon vor dem Ergebnis begonnenes Einrichten bleibt ebenso stehen.
+    let nr = anmeldNr, snr = setupNr;
+    const begonnen = () => nr !== anmeldNr || snr !== setupNr;
+    const gespeichert = sb.auth.getSession().then(r => r?.data?.session || null, () => null);
+    const pruefe = (session) => {
+      // Liegt inzwischen eine andere Sitzung im Speicher (z. B. eine Anmeldung in einem anderen Tab), ist das Ergebnis veraltet:
+      // nicht als die alte anmelden und nicht abmelden (das träfe die neue Sitzung)
+      let jetzt = null; try { jetzt = JSON.parse(localStorage.getItem(sb.auth.storageKey))?.access_token || null; } catch {}
+      if (session && jetzt !== session.access_token) return false;
+      const stamp = loginStamp.get(String(session?.user?.email || "").toLowerCase());
+      if (session && !kalUser(session)) lockOut();
+      else if (session && stamp && Date.now() - stamp < MAX_SESSION_MS) { myEmail = session.user.email.toLowerCase(); enter(); checkMe(); }
+      else if (session) lockOut("Die Anmeldung ist abgelaufen. Bitte erneut anmelden.");
+      else return false;
+      return true;
+    };
+    const erst = await Promise.race([gespeichert, new Promise(r => setTimeout(r, 15000, undefined))]);
+    if (erst !== undefined) {
+      if (!isLocked()) return;
+      if (begonnen()) loadNames(); else if (!pruefe(erst)) showLogin();
+      return;
+    }
+    if (!isLocked()) return;
+    if (begonnen()) { loadNames(); return; }
+    showLogin("Die Verbindung ist gerade sehr langsam. Bitte warten oder neu anmelden.");
+    nr = anmeldNr; snr = setupNr;
+    gespeichert.then(s => { if (s && isLocked() && !begonnen() && !$("loginPw").value) pruefe(s); });
   })();
 })();
