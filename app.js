@@ -1832,7 +1832,7 @@
   // (der Server könnte ihn gleich wieder beenden oder Beitritte länger ablehnen), in einem verborgenen Tab erst beim
   // Sichtbarwerden. Wieder von vorn nur, wenn der Kanal selbst länger als eine Minute verbunden war. Nach dem Verbinden lädt
   // die Seite wie immer nach, was inzwischen geändert wurde.
-  let liveT = 0, liveN = 0;
+  let liveT = 0, liveN = 0, liveBis = 0;
   const beigetreten = new WeakMap();
   function kanalZu(ch) {
     if (ch === channel) { channel = null; joined = false; setStatus("readonly", "Getrennt"); }
@@ -1851,15 +1851,17 @@
     const da = sb.realtime.getChannels();
     for (const ch of [channel, pchannel]) if (ch && !da.includes(ch)) kanalZu(ch);
   }
-  // Ist schon ein Versuch geplant, bleibt es dabei (zwei beendete Kanäle zählen den Abstand nur einmal hoch); sofort nur beim
-  // Anmelden, Sichtbarwerden und wenn das Netz zurück ist.
+  // Ist schon ein Versuch geplant, der nicht später kommt, bleibt es dabei (zwei beendete Kanäle zählen den Abstand nur einmal
+  // hoch); einen späteren ersetzt der neue, etwa nach dem Zurücksetzen. Sofort beim Sichtbarwerden und wenn das Netz zurück ist.
   function liveWieder(sofort) {
-    if (liveT && !sofort) return;
+    const warte = sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN);
+    if (liveT && Date.now() + warte >= liveBis) return;
     clearTimeout(liveT); liveT = 0;
     if (!sb || isLocked() || (channel && pchannel) || document.visibilityState !== "visible") return;
+    if (!sofort) liveN++;
+    liveBis = Date.now() + warte;
     const sg = sitzGen;
-    liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg) && document.visibilityState === "visible" && !(channel && pchannel)) liveStart(sg); },
-      sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
+    liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg) && document.visibilityState === "visible" && !(channel && pchannel)) liveStart(sg); }, warte);
   }
   // Live-Kanäle nur mit dem Token der angezeigten Person anlegen. Wartet auf eine laufende Erneuerung, auch in einem anderen
   // Tab (Sperre der Bibliothek), und gibt das Token der Live-Verbindung direkt mit (die Nachricht des anderen Tabs kommt
