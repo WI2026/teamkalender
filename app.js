@@ -740,7 +740,8 @@
   function takt(sofort) {
     clearTimeout(taktT); taktT = 0;
     if (!sb || taktLauf || isLocked() || document.visibilityState !== "visible" || typeof sb.auth._autoRefreshTokenTick !== "function") return;
-    if (!sofort) { taktT = setTimeout(takt, 30000, true); return; }
+    // Nebenbei alle 30 s nachsehen, ob ein Live-Kanal still verloren ging (siehe kanalVerloren)
+    if (!sofort) { taktT = setTimeout(() => { kanalVerloren(); takt(true); }, 30000); return; }
     taktLauf = sb.auth._autoRefreshTokenTick().catch(() => {}).finally(() => { taktLauf = null; takt(); });
   }
   // Die Bibliothek ruft diese Funktion auf, sobald eine Abfrage abgeschickt wird (await), noch bevor sie auf ihr Token wartet:
@@ -852,7 +853,7 @@
     if (k === lastRangeKey) return;
     lastRangeKey = k; clearTimeout(navT); navT = setTimeout(refresh, 200);
   };
-  addEventListener("online", () => { if (sb && !isLocked()) { refresh(); if (state.projLoaded) projAbgleich(); liveWieder(true); } });
+  addEventListener("online", () => { if (sb && !isLocked()) { refresh(); if (state.projLoaded) projAbgleich(); kanalVerloren(); liveWieder(true); } });
 
   // ---------- Projekte (Supabase) ----------
   // Geladen werden alle Projekte (nur Kopfdaten, wenig Daten) und die Schritte der nicht fertigen. Schritte fertiger Projekte erst bei Bedarf.
@@ -1770,8 +1771,19 @@
   // Ein abgelehnter Beitritt (z. B. Token abgelaufen) lässt den Kanal auf „joining“ stehen; die Bibliothek versucht es dann
   // nicht wieder. Wie einen vom Server beendeten Kanal behandeln.
   const abgelehnt = (st, ch) => st === "CHANNEL_ERROR" && ch.state === "joining";
+  // Fehler der Bibliothek: ein erneuter Beitritt, solange der vorige noch auf Antwort wartet (Verbindung dabei abgerissen),
+  // behält dessen Zeitgeber und bekommt so keine Kennung. Die Antwort kommt nie an, und beim Beenden eines Kanals ohne Kennung
+  // wirft die Bibliothek alle anderen ohne Kennung mit aus ihrer Liste (sie kämen nie wieder). Den Zeitgeber vorher beenden.
+  function beitrittFest(ch) {
+    const jp = ch.joinPush;
+    if (jp && typeof jp.resend === "function" && typeof jp._cancelTimeout === "function") {
+      const nochmal = jp.resend.bind(jp);
+      jp.resend = (t) => { jp._cancelTimeout(); nochmal(t); };
+    }
+    return ch;
+  }
   function termineKanal() {
-    const ch = sb.channel("termine-live")
+    const ch = beitrittFest(sb.channel("termine-live"))
       // Änderungen der anderen kommen einzeln an, ohne alles neu zu laden.
       .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
         if (isLocked()) return;
@@ -1784,7 +1796,7 @@
       .subscribe((st) => {
         if (ch !== channel) return;
         // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
-        if (st === "SUBSCRIBED") { joined = true; liveSeit = Date.now(); clearTimeout(firstT); refresh(); }
+        if (st === "SUBSCRIBED") { joined = true; beigetreten.set(ch, Date.now()); clearTimeout(firstT); refresh(); }
         else if (st === "CLOSED" || abgelehnt(st, ch)) kanalZu(ch);
         else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") { joined = false; setStatus("readonly", "Getrennt"); if (!state.ranges.length && !isLocked()) refresh(); }
       });
@@ -1793,7 +1805,7 @@
   }
   // Projekte und Schritte über eine eigene Verbindung: ein Problem dort stört die Termine nicht
   function projekteKanal() {
-    const ch = sb.channel("projekte-live")
+    const ch = beitrittFest(sb.channel("projekte-live"))
       .on("postgres_changes", { event: "*", schema: "public", table: PT }, (p) => {
         if (isLocked()) return;
         if (p.eventType === "DELETE") dropProjekt(p.old && p.old.id);
@@ -1809,7 +1821,7 @@
       .subscribe((st) => {
         if (ch !== pchannel) return;
         pEpoch++; clearTimeout(standT);
-        if (st === "SUBSCRIBED") { pjoined = true; liveSeit = Date.now(); clearTimeout(pFirstT); projAbgleich(); }
+        if (st === "SUBSCRIBED") { pjoined = true; beigetreten.set(ch, Date.now()); clearTimeout(pFirstT); projAbgleich(); }
         else if (st === "CLOSED" || abgelehnt(st, ch)) kanalZu(ch);
       });
     kanaele.add(ch);
@@ -1817,34 +1829,48 @@
   }
   // Der Server beendet einen Kanal, etwa wenn dessen Token abgelaufen ist (Tab länger verborgen, als das Token gilt); die
   // Bibliothek verbindet ihn dann nicht neu. Den Kanal verwerfen und mit frischem Token neu anlegen: mit wachsendem Abstand
-  // (der Server könnte ihn gleich wieder beenden), in einem verborgenen Tab erst beim Sichtbarwerden. Nach dem Verbinden lädt
+  // (der Server könnte ihn gleich wieder beenden oder Beitritte länger ablehnen), in einem verborgenen Tab erst beim
+  // Sichtbarwerden. Wieder von vorn nur, wenn der Kanal selbst länger als eine Minute verbunden war. Nach dem Verbinden lädt
   // die Seite wie immer nach, was inzwischen geändert wurde.
-  let liveT = 0, liveN = 0, liveSeit = 0;
+  let liveT = 0, liveN = 0;
+  const beigetreten = new WeakMap();
   function kanalZu(ch) {
     if (ch === channel) { channel = null; joined = false; setStatus("readonly", "Getrennt"); }
     else { pchannel = null; pjoined = false; }
     // Den verworfenen Kanal stilllegen, sobald die Bibliothek mit ihm fertig ist: meldet sie ihn beim Wiederbeitritt selbst ab
     // („CLOSED“), tritt er trotzdem weiter bei, mit seinem alten Token, und wirft dabei den neuen Kanal desselben Themas hinaus.
     setTimeout(() => stilllegen(ch));
-    if (Date.now() - liveSeit > 60 * 1000) liveN = 0;
+    const seit = beigetreten.get(ch);
+    if (seit && Date.now() - seit > 60 * 1000) liveN = 0;
     liveWieder();
   }
   function stilllegen(ch) { if (kanaele.delete(ch)) ch.unsubscribe(); }
+  // Ein aktueller Kanal, der nicht mehr in der Liste der Bibliothek steht, kommt nie wieder: wie einen beendeten behandeln
+  function kanalVerloren() {
+    if (!sb || isLocked()) return;
+    const da = sb.realtime.getChannels();
+    for (const ch of [channel, pchannel]) if (ch && !da.includes(ch)) kanalZu(ch);
+  }
+  // Ist schon ein Versuch geplant, bleibt es dabei (zwei beendete Kanäle zählen den Abstand nur einmal hoch); sofort nur beim
+  // Anmelden, Sichtbarwerden und wenn das Netz zurück ist.
   function liveWieder(sofort) {
+    if (liveT && !sofort) return;
     clearTimeout(liveT); liveT = 0;
     if (!sb || isLocked() || (channel && pchannel) || document.visibilityState !== "visible") return;
     const sg = sitzGen;
-    liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg)) liveStart(sg); }, sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
+    liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg) && document.visibilityState === "visible" && !(channel && pchannel)) liveStart(sg); },
+      sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
   }
-  // Live-Kanäle nur mit gültigem Token der angezeigten Person anlegen: ein Beitritt mit abgelaufenem Token wird abgelehnt.
-  // Wartet auf eine laufende Erneuerung, auch in einem anderen Tab (Sperre der Bibliothek), und gibt das Token der Live-
-  // Verbindung direkt mit (die Nachricht des anderen Tabs kommt vielleicht erst später). Sonst später noch einmal.
+  // Live-Kanäle nur mit dem Token der angezeigten Person anlegen. Wartet auf eine laufende Erneuerung, auch in einem anderen
+  // Tab (Sperre der Bibliothek), und gibt das Token der Live-Verbindung direkt mit (die Nachricht des anderen Tabs kommt
+  // vielleicht erst später). Ein abgelaufenes Token erneuert getSession vorher; ohne Sitzung später noch einmal. Die Gültigkeit
+  // nicht an der Uhr des Geräts messen (geht sie vor, gälte jedes Token als abgelaufen): lehnt der Server ab, gilt kanalZu.
   async function liveStart(sg) {
     takt(true);
     if (taktLauf) await taktLauf;
     let s = null; try { s = (await within(sb.auth.getSession(), 35000)).data.session; } catch {}
     if (!gleicheSitzung(sg)) return;
-    if (!s || String(s.user?.email || "").toLowerCase() !== myEmail || s.expires_at * 1000 <= Date.now()) { liveWieder(); return; }
+    if (!s || String(s.user?.email || "").toLowerCase() !== myEmail) { liveWieder(); return; }
     for (const c of kanaele) if (c !== channel && c !== pchannel) stilllegen(c);
     sb.realtime.setAuth(s.access_token);
     startLive();
@@ -1855,7 +1881,7 @@
     if (document.hidden) { hiddenAt = Date.now(); return; }
     takt(true);
     if (sb && !isLocked() && Date.now() - hiddenAt > 60 * 1000) { refresh(); projAbgleich(); }
-    liveWieder(true);
+    kanalVerloren(); liveWieder(true);
   });
 
   // Anmeldung gilt höchstens 30 Tage auf einem Gerät, danach muss das Passwort neu eingegeben werden.
