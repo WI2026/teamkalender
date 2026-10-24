@@ -734,8 +734,8 @@
   // Token-Erneuerung selbst takten (autoRefreshToken: false). Der Takt der Bibliothek reiht sich alle 30 s hinter eine noch
   // laufende Erneuerung ein: bekommt keine innerhalb von 30 s Antwort, beginnt die nächste sofort, und die Sperre der Bibliothek
   // wird nie frei (die Seite und neue Tabs warten dann endlos). Hier beginnt der nächste Takt erst 30 s nach dem Ende des vorigen,
-  // und wie bei der Bibliothek nur in einem sichtbaren Tab (beim Sichtbarwerden sofort), hier zudem nur angemeldet. Ein
-  // abgelaufenes Token erneuert die Bibliothek ohnehin vor der nächsten Anfrage.
+  // und wie bei der Bibliothek nur in einem sichtbaren Tab (beim Anmelden und Sichtbarwerden sofort), hier zudem nur angemeldet.
+  // Ein abgelaufenes Token erneuert die Bibliothek ohnehin vor der nächsten Anfrage.
   let taktT = 0, taktLauf = null;
   function takt(sofort) {
     clearTimeout(taktT); taktT = 0;
@@ -838,7 +838,9 @@
     const warSchreibbar = state.canWrite;
     state.canWrite = true;
     if (!warSchreibbar && progDlg.open) renderProg();
-    setStatus("live", "Live", "für alle sichtbar"); $("banner").hidden = true;
+    // Ohne Live-Kanal (vom Server beendet, wird gerade neu verbunden) nicht „Live“ anzeigen
+    if (channel) setStatus("live", "Live", "für alle sichtbar"); else setStatus("readonly", "Getrennt");
+    $("banner").hidden = true;
     afterChange();
     // Ein entzogener Zugang liefert keine Fehler, sondern nur noch leere Monate. Daher regelmäßig nachfragen.
     if (Date.now() - meAt > 60 * 1000) checkMe();
@@ -850,7 +852,7 @@
     if (k === lastRangeKey) return;
     lastRangeKey = k; clearTimeout(navT); navT = setTimeout(refresh, 200);
   };
-  addEventListener("online", () => { if (sb && !isLocked()) { refresh(); if (state.projLoaded) projAbgleich(); } });
+  addEventListener("online", () => { if (sb && !isLocked()) { refresh(); if (state.projLoaded) projAbgleich(); liveWieder(true); } });
 
   // ---------- Projekte (Supabase) ----------
   // Geladen werden alle Projekte (nur Kopfdaten, wenig Daten) und die Schritte der nicht fertigen. Schritte fertiger Projekte erst bei Bedarf.
@@ -1758,9 +1760,13 @@
   }
   $("pdfBtn").addEventListener("click", exportPdf);
   let channel = null, joined = false, firstT = null, pchannel = null, pjoined = false, pFirstT = null;
+  // Fehlende Live-Kanäle anlegen: beim Anmelden beide, nach einem vom Server beendeten Kanal nur diesen
   function startLive() {
-    if (channel) return;
-    channel = sb.channel("termine-live")
+    if (!channel) channel = termineKanal();
+    if (!pchannel) pchannel = projekteKanal();
+  }
+  function termineKanal() {
+    const ch = sb.channel("termine-live")
       // Änderungen der anderen kommen einzeln an, ohne alles neu zu laden.
       .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
         if (isLocked()) return;
@@ -1771,12 +1777,17 @@
         progTermineBald(p);
       })
       .subscribe((st) => {
+        if (ch !== channel) return;
         // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
-        if (st === "SUBSCRIBED") { joined = true; clearTimeout(firstT); refresh(); }
+        if (st === "SUBSCRIBED") { joined = true; liveSeit = Date.now(); clearTimeout(firstT); refresh(); }
         else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") { setStatus("readonly", "Getrennt"); if (!state.ranges.length && !isLocked()) refresh(); }
+        else if (st === "CLOSED") kanalZu(ch);
       });
-    // Projekte und Schritte über eine eigene Verbindung: ein Problem dort stört die Termine nicht
-    pchannel = sb.channel("projekte-live")
+    return ch;
+  }
+  // Projekte und Schritte über eine eigene Verbindung: ein Problem dort stört die Termine nicht
+  function projekteKanal() {
+    const ch = sb.channel("projekte-live")
       .on("postgres_changes", { event: "*", schema: "public", table: PT }, (p) => {
         if (isLocked()) return;
         if (p.eventType === "DELETE") dropProjekt(p.old && p.old.id);
@@ -1790,9 +1801,35 @@
         standBald(); afterProjBald();
       })
       .subscribe((st) => {
+        if (ch !== pchannel) return;
         pEpoch++; clearTimeout(standT);
-        if (st === "SUBSCRIBED") { pjoined = true; clearTimeout(pFirstT); projAbgleich(); }
+        if (st === "SUBSCRIBED") { pjoined = true; liveSeit = Date.now(); clearTimeout(pFirstT); projAbgleich(); }
+        else if (st === "CLOSED") kanalZu(ch);
       });
+    return ch;
+  }
+  // Der Server beendet einen Kanal, etwa wenn dessen Token abgelaufen ist (Tab länger verborgen, als das Token gilt); die
+  // Bibliothek verbindet ihn dann nicht neu. Den Kanal verwerfen und mit frischem Token neu anlegen: mit wachsendem Abstand
+  // (der Server könnte ihn gleich wieder beenden), in einem verborgenen Tab erst beim Sichtbarwerden. Nach dem Verbinden lädt
+  // die Seite wie immer nach, was inzwischen geändert wurde.
+  let liveT = 0, liveN = 0, liveSeit = 0;
+  function kanalZu(ch) {
+    if (ch === channel) { channel = null; joined = false; setStatus("readonly", "Getrennt"); }
+    else { pchannel = null; pjoined = false; }
+    if (Date.now() - liveSeit > 60 * 1000) liveN = 0;
+    liveWieder();
+  }
+  function liveWieder(sofort) {
+    clearTimeout(liveT); liveT = 0;
+    if (!sb || isLocked() || (channel && pchannel) || document.visibilityState !== "visible") return;
+    const sg = sitzGen;
+    liveT = setTimeout(async () => {
+      liveT = 0;
+      if (!gleicheSitzung(sg)) return;
+      takt(true);
+      if (taktLauf) await taktLauf;
+      if (gleicheSitzung(sg)) startLive();
+    }, sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
   }
   // Nach mehr als einer Minute im Hintergrund den sichtbaren Zeitraum auffrischen.
   let hiddenAt = Date.now();
@@ -1800,6 +1837,7 @@
     if (document.hidden) { hiddenAt = Date.now(); return; }
     takt(true);
     if (sb && !isLocked() && Date.now() - hiddenAt > 60 * 1000) { refresh(); projAbgleich(); }
+    liveWieder(true);
   });
 
   // Anmeldung gilt höchstens 30 Tage auf einem Gerät, danach muss das Passwort neu eingegeben werden.
@@ -1811,8 +1849,11 @@
     set(v, mail) { try { v ? localStorage.setItem("kal.loginAt", v + (mail ? " " + mail : "")) : localStorage.removeItem("kal.loginAt"); } catch {} } };
 
   function clearData() {
-    if (channel) { sb.removeChannel(channel); channel = null; }
-    if (pchannel) { sb.removeChannel(pchannel); pchannel = null; }
+    // Erst die Verweise lösen: das Entfernen meldet „CLOSED“ an die Rückrufe, die nur den aktuellen Kanal beachten
+    const c = channel, pc = pchannel;
+    channel = pchannel = null; clearTimeout(liveT); liveT = 0; liveN = 0;
+    if (c) sb.removeChannel(c);
+    if (pc) sb.removeChannel(pc);
     pjoined = false; pEpoch++; clearTimeout(pFirstT); clearTimeout(standT); projStand = null;
     if (projRaf) { cancelAnimationFrame(projRaf); projRaf = 0; }
     loadSeq++; lastRangeKey = ""; joined = false; touched = new Set(); geloescht = new Set();
@@ -1890,13 +1931,18 @@
     document.body.classList.remove("locked");
     $("loginPw").value = "";
     showMe();
-    startLive();
-    takt();
     // Die erste Ladung kommt mit dem Verbinden der Live-Verbindung; hängt diese, nach 3 s direkt laden.
     clearTimeout(firstT);
     firstT = setTimeout(() => { if (!joined && !isLocked()) refresh(); }, 3000);
     clearTimeout(pFirstT);
     pFirstT = setTimeout(() => { if (!pjoined && !isLocked()) loadProjekte(); }, 3000);
+    // Zuerst ein Takt: läuft das gespeicherte Token bald ab (Seite kurz vor Ablauf geöffnet), wird es erneuert, bevor die ersten
+    // Anfragen damit hinausgehen, und die Live-Kanäle treten erst danach bei, also mit dem neuen Token statt dem öffentlichen
+    // Schlüssel. Sonst liest der Takt nur die gespeicherte Sitzung und ist sofort fertig.
+    const sg = sitzGen;
+    takt(true);
+    if (taktLauf) await taktLauf;
+    if (gleicheSitzung(sg)) startLive();
   }
 
   // ---------- Wer bin ich ----------
@@ -2516,8 +2562,13 @@
     }
     if (!isLocked()) return;
     if (begonnen()) { loadNames(); return; }
-    showLogin("Die Verbindung ist gerade sehr langsam. Bitte warten oder neu anmelden.");
+    const LANGSAM = "Die Verbindung ist gerade sehr langsam. Bitte warten oder neu anmelden.";
+    showLogin(LANGSAM);
     nr = anmeldNr; snr = setupNr;
-    gespeichert.then(s => { if (s && isLocked() && !begonnen() && !$("loginPw").value) pruefe(s); });
+    gespeichert.then(s => {
+      if (!isLocked() || (s && !begonnen() && !$("loginPw").value && pruefe(s))) return;
+      // Nicht übernommen (Erneuerung gescheitert, schon mit Anmelden begonnen, inzwischen andere Sitzung): nicht weiter zum Warten auffordern
+      if ($("loginErr").textContent === LANGSAM) $("loginErr").textContent = s ? "" : "Die gespeicherte Anmeldung ließ sich nicht prüfen. Bitte neu anmelden.";
+    });
   })();
 })();
