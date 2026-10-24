@@ -838,8 +838,8 @@
     const warSchreibbar = state.canWrite;
     state.canWrite = true;
     if (!warSchreibbar && progDlg.open) renderProg();
-    // Ohne Live-Kanal (vom Server beendet, wird gerade neu verbunden) nicht „Live“ anzeigen
-    if (channel) setStatus("live", "Live", "für alle sichtbar"); else setStatus("readonly", "Getrennt");
+    // Ohne beigetretenen Live-Kanal (noch nicht verbunden, getrennt, vom Server beendet) nicht „Live“ anzeigen
+    if (joined) setStatus("live", "Live", "für alle sichtbar"); else setStatus("readonly", "Getrennt");
     $("banner").hidden = true;
     afterChange();
     // Ein entzogener Zugang liefert keine Fehler, sondern nur noch leere Monate. Daher regelmäßig nachfragen.
@@ -1760,11 +1760,16 @@
   }
   $("pdfBtn").addEventListener("click", exportPdf);
   let channel = null, joined = false, firstT = null, pchannel = null, pjoined = false, pFirstT = null;
-  // Fehlende Live-Kanäle anlegen: beim Anmelden beide, nach einem vom Server beendeten Kanal nur diesen
+  // Alle angelegten Kanäle, auch verworfene: beim Sperren werden alle beendet (siehe kanalZu)
+  const kanaele = new Set();
+  // Fehlende Live-Kanäle anlegen: beim Anmelden beide, nach einem beendeten Kanal nur diesen
   function startLive() {
     if (!channel) channel = termineKanal();
     if (!pchannel) pchannel = projekteKanal();
   }
+  // Ein abgelehnter Beitritt (z. B. Token abgelaufen) lässt den Kanal auf „joining“ stehen; die Bibliothek versucht es dann
+  // nicht wieder. Wie einen vom Server beendeten Kanal behandeln.
+  const abgelehnt = (st, ch) => st === "CHANNEL_ERROR" && ch.state === "joining";
   function termineKanal() {
     const ch = sb.channel("termine-live")
       // Änderungen der anderen kommen einzeln an, ohne alles neu zu laden.
@@ -1780,9 +1785,10 @@
         if (ch !== channel) return;
         // Nach jedem (Wieder-)Verbinden neu laden, damit verpasste Änderungen nachkommen.
         if (st === "SUBSCRIBED") { joined = true; liveSeit = Date.now(); clearTimeout(firstT); refresh(); }
-        else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") { setStatus("readonly", "Getrennt"); if (!state.ranges.length && !isLocked()) refresh(); }
-        else if (st === "CLOSED") kanalZu(ch);
+        else if (st === "CLOSED" || abgelehnt(st, ch)) kanalZu(ch);
+        else if (st === "CHANNEL_ERROR" || st === "TIMED_OUT") { joined = false; setStatus("readonly", "Getrennt"); if (!state.ranges.length && !isLocked()) refresh(); }
       });
+    kanaele.add(ch);
     return ch;
   }
   // Projekte und Schritte über eine eigene Verbindung: ein Problem dort stört die Termine nicht
@@ -1804,8 +1810,9 @@
         if (ch !== pchannel) return;
         pEpoch++; clearTimeout(standT);
         if (st === "SUBSCRIBED") { pjoined = true; liveSeit = Date.now(); clearTimeout(pFirstT); projAbgleich(); }
-        else if (st === "CLOSED") kanalZu(ch);
+        else if (st === "CLOSED" || abgelehnt(st, ch)) kanalZu(ch);
       });
+    kanaele.add(ch);
     return ch;
   }
   // Der Server beendet einen Kanal, etwa wenn dessen Token abgelaufen ist (Tab länger verborgen, als das Token gilt); die
@@ -1816,20 +1823,31 @@
   function kanalZu(ch) {
     if (ch === channel) { channel = null; joined = false; setStatus("readonly", "Getrennt"); }
     else { pchannel = null; pjoined = false; }
+    // Den verworfenen Kanal stilllegen, sobald die Bibliothek mit ihm fertig ist: meldet sie ihn beim Wiederbeitritt selbst ab
+    // („CLOSED“), tritt er trotzdem weiter bei, mit seinem alten Token, und wirft dabei den neuen Kanal desselben Themas hinaus.
+    setTimeout(() => stilllegen(ch));
     if (Date.now() - liveSeit > 60 * 1000) liveN = 0;
     liveWieder();
   }
+  function stilllegen(ch) { if (kanaele.delete(ch)) ch.unsubscribe(); }
   function liveWieder(sofort) {
     clearTimeout(liveT); liveT = 0;
     if (!sb || isLocked() || (channel && pchannel) || document.visibilityState !== "visible") return;
     const sg = sitzGen;
-    liveT = setTimeout(async () => {
-      liveT = 0;
-      if (!gleicheSitzung(sg)) return;
-      takt(true);
-      if (taktLauf) await taktLauf;
-      if (gleicheSitzung(sg)) startLive();
-    }, sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
+    liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg)) liveStart(sg); }, sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN++));
+  }
+  // Live-Kanäle nur mit gültigem Token der angezeigten Person anlegen: ein Beitritt mit abgelaufenem Token wird abgelehnt.
+  // Wartet auf eine laufende Erneuerung, auch in einem anderen Tab (Sperre der Bibliothek), und gibt das Token der Live-
+  // Verbindung direkt mit (die Nachricht des anderen Tabs kommt vielleicht erst später). Sonst später noch einmal.
+  async function liveStart(sg) {
+    takt(true);
+    if (taktLauf) await taktLauf;
+    let s = null; try { s = (await within(sb.auth.getSession(), 35000)).data.session; } catch {}
+    if (!gleicheSitzung(sg)) return;
+    if (!s || String(s.user?.email || "").toLowerCase() !== myEmail || s.expires_at * 1000 <= Date.now()) { liveWieder(); return; }
+    for (const c of kanaele) if (c !== channel && c !== pchannel) stilllegen(c);
+    sb.realtime.setAuth(s.access_token);
+    startLive();
   }
   // Nach mehr als einer Minute im Hintergrund den sichtbaren Zeitraum auffrischen.
   let hiddenAt = Date.now();
@@ -1849,11 +1867,13 @@
     set(v, mail) { try { v ? localStorage.setItem("kal.loginAt", v + (mail ? " " + mail : "")) : localStorage.removeItem("kal.loginAt"); } catch {} } };
 
   function clearData() {
-    // Erst die Verweise lösen: das Entfernen meldet „CLOSED“ an die Rückrufe, die nur den aktuellen Kanal beachten
-    const c = channel, pc = pchannel;
-    channel = pchannel = null; clearTimeout(liveT); liveT = 0; liveN = 0;
-    if (c) sb.removeChannel(c);
-    if (pc) sb.removeChannel(pc);
+    // Alle Kanäle beenden, auch verworfene. Erst die Verweise lösen: das Entfernen meldet „CLOSED“ an die Rückrufe, die nur den
+    // aktuellen Kanal beachten. Ist die Verbindung gerade getrennt, warten Beitritte mit dem Token dieser Anmeldung im Puffer der
+    // Bibliothek und gingen beim nächsten Verbinden (dann schon für die nächste Person) hinaus: verwerfen.
+    const alle = [...kanaele];
+    kanaele.clear(); channel = pchannel = null; clearTimeout(liveT); liveT = 0; liveN = 0;
+    for (const c of alle) sb.removeChannel(c);
+    if (sb.realtime && !sb.realtime.isConnected() && Array.isArray(sb.realtime.sendBuffer)) sb.realtime.sendBuffer = [];
     pjoined = false; pEpoch++; clearTimeout(pFirstT); clearTimeout(standT); projStand = null;
     if (projRaf) { cancelAnimationFrame(projRaf); projRaf = 0; }
     loadSeq++; lastRangeKey = ""; joined = false; touched = new Set(); geloescht = new Set();
@@ -1939,10 +1959,7 @@
     // Zuerst ein Takt: läuft das gespeicherte Token bald ab (Seite kurz vor Ablauf geöffnet), wird es erneuert, bevor die ersten
     // Anfragen damit hinausgehen, und die Live-Kanäle treten erst danach bei, also mit dem neuen Token statt dem öffentlichen
     // Schlüssel. Sonst liest der Takt nur die gespeicherte Sitzung und ist sofort fertig.
-    const sg = sitzGen;
-    takt(true);
-    if (taktLauf) await taktLauf;
-    if (gleicheSitzung(sg)) startLive();
+    liveStart(sitzGen);
   }
 
   // ---------- Wer bin ich ----------
