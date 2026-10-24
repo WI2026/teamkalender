@@ -981,17 +981,36 @@
     if (r.error || r.data !== projStand) loadProjekte();
   }
   // Live-Änderungen verändern den Stand. Den neuen Stand erst merken, wenn die Verbindung danach noch einige Sekunden steht
-  // (dann sind auch Änderungen angekommen, die beim Abfragen noch unterwegs waren).
-  let standT = null, pEpoch = 0;
+  // (dann sind auch Änderungen angekommen, die beim Abfragen noch unterwegs waren) und dann nachweislich noch Antwort gibt:
+  // reißt sie still ab (Funkwechsel, ohne Meldung), merkt die Bibliothek das erst nach bis zu einer Minute. Der Stand enthielte
+  // dann Änderungen, die nie ankamen, und beim Wiederverbinden würde nicht neu geladen.
+  let standT = null, pEpoch = 0, standNr = 0;
   function standBald() {
     clearTimeout(standT);
-    const ep = pEpoch, seq = projSeq;
+    const ep = pEpoch, seq = projSeq, nr = ++standNr;
+    const gilt = () => nr === standNr && ep === pEpoch && seq === projSeq && !isLocked();
     standT = setTimeout(async () => {
       let r;
       try { r = await sb.rpc("kalender_projekt_stand"); } catch { return; }
-      if (r.error || ep !== pEpoch || seq !== projSeq || isLocked()) return;
-      standT = setTimeout(() => { if (ep === pEpoch && seq === projSeq) projStand = r.data; }, 5000);
+      if (r.error || !gilt()) return;
+      standT = setTimeout(async () => { if (gilt() && await lebtNoch(10000) && gilt()) projStand = r.data; }, 5000);
     }, 3000);
+  }
+  // Lebenszeichen über die Live-Verbindung: der Server antwortet über dieselbe Verbindung, also erst nach allem, was er vorher
+  // geschickt hat. Eigene Kennungen, damit der Herzschlag der Bibliothek unberührt bleibt.
+  const lebtWartet = new Map();
+  let lebtN = 0;
+  if (sb && sb.realtime && Array.isArray(sb.realtime.stateChangeCallbacks?.message))
+    sb.realtime.stateChangeCallbacks.message.push((m) => { const f = m && m.topic === "phoenix" && lebtWartet.get(m.ref); if (f) f(); });
+  function lebtNoch(ms) {
+    return new Promise((fertig) => {
+      const rt = sb && sb.realtime;
+      if (!rt || !rt.isConnected() || !Array.isArray(rt.stateChangeCallbacks?.message)) { fertig(false); return; }
+      const ref = "kal" + ++lebtN;
+      const t = setTimeout(() => { lebtWartet.delete(ref); fertig(false); }, ms);
+      lebtWartet.set(ref, () => { clearTimeout(t); lebtWartet.delete(ref); fertig(true); });
+      rt.push({ topic: "phoenix", event: "heartbeat", payload: {}, ref });
+    });
   }
   // Schritte einzelner Projekte nachladen (fertige Projekte, neu angelegte, wieder geöffnete)
   async function ensureSchritte(ids) {
@@ -1836,7 +1855,7 @@
   const beigetreten = new WeakMap();
   function kanalZu(ch) {
     if (ch === channel) { channel = null; joined = false; setStatus("readonly", "Getrennt"); }
-    else { pchannel = null; pjoined = false; }
+    else { pchannel = null; pjoined = false; pEpoch++; clearTimeout(standT); }
     // Den verworfenen Kanal stilllegen, sobald die Bibliothek mit ihm fertig ist: meldet sie ihn beim Wiederbeitritt selbst ab
     // („CLOSED“), tritt er trotzdem weiter bei, mit seinem alten Token, und wirft dabei den neuen Kanal desselben Themas hinaus.
     setTimeout(() => stilllegen(ch));
@@ -1852,14 +1871,16 @@
     for (const ch of [channel, pchannel]) if (ch && !da.includes(ch)) kanalZu(ch);
   }
   // Ist schon ein Versuch geplant, der nicht später kommt, bleibt es dabei (zwei beendete Kanäle zählen den Abstand nur einmal
-  // hoch); einen späteren ersetzt der neue, etwa nach dem Zurücksetzen. Sofort beim Sichtbarwerden und wenn das Netz zurück ist.
+  // hoch); einen späteren ersetzt der neue, etwa nach dem Zurücksetzen. Sofort beim Sichtbarwerden und wenn das Netz zurück ist,
+  // dann immer. Gemessen mit der Uhr der Zeitgeber (performance.now): im Ruhezustand des Geräts steht sie wie diese, Date.now
+  // läuft weiter.
   function liveWieder(sofort) {
     const warte = sofort ? 0 : Math.min(60000, 2000 * 2 ** liveN);
-    if (liveT && Date.now() + warte >= liveBis) return;
+    if (liveT && !sofort && performance.now() + warte >= liveBis) return;
     clearTimeout(liveT); liveT = 0;
     if (!sb || isLocked() || (channel && pchannel) || document.visibilityState !== "visible") return;
     if (!sofort) liveN++;
-    liveBis = Date.now() + warte;
+    liveBis = performance.now() + warte;
     const sg = sitzGen;
     liveT = setTimeout(() => { liveT = 0; if (gleicheSitzung(sg) && document.visibilityState === "visible" && !(channel && pchannel)) liveStart(sg); }, warte);
   }
